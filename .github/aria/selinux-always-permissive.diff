@@ -1,0 +1,26 @@
+--- a/security/selinux/include/security.h
++++ b/security/selinux/include/security.h
+@@ -139,6 +139,10 @@
+ 
+ static inline void enforcing_set(struct selinux_state *state, bool value)
+ {
++#ifdef CONFIG_SECURITY_SELINUX_ALWAYS_PERMISSIVE
++	/* Aria: SELinux is locked to permissive, ignore any request to enforce */
++	value = false;
++#endif
+ 	WRITE_ONCE(state->enforcing, value);
+ }
+ #else
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -159,6 +159,10 @@
+ 		goto out;
+ 
+ 	new_value = !!new_value;
++#ifdef CONFIG_SECURITY_SELINUX_ALWAYS_PERMISSIVE
++	/* Aria: locked to permissive, setenforce 1 is accepted but has no effect */
++	new_value = 0;
++#endif
+ 
+ 	old_value = enforcing_enabled(state);
+ 	if (new_value != old_value) {
