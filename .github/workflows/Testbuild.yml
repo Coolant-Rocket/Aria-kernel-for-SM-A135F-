@@ -1,0 +1,674 @@
+name: Check CIP Merge & Build Diagnostics (Aria / Exynos850)
+
+# Diagnostic & Smart-Resolution workflow for merging CIP 4.19 (-st, -st-rc, -cip) into Exynos850:
+# 1. Inspect the cloned kernel tree's current Linux 4.19 / CIP / ST baseline (Makefile, localversion-st, localversion-cip)
+# 2. Fetch https://git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip.git and compare against:
+#    - linux-4.19.y-st-rc (bleeding-edge ST release candidate backports)
+#    - linux-4.19.y-st    (tagged Stable-Tree backports from 5.4/5.10 LTS)
+#    - linux-4.19.y-cip   (official CIP release branch = linux-4.19.y-st + CIP Industrial patches)
+# 3. Perform a 3-way merge, generate a full conflict report, and support smart conflict resolution (`smart_exynos850_and_build`):
+#    - Removes the 13 modify/delete files (non-Samsung DTS/tg3 deleted in OEM import)
+#    - Keeps HEAD (`ours`) on the 42 content-conflicted files (Samsung Exynos850 hardware drivers, OneUI F2FS/ext4, Android KABI/BPF)
+#    - Combines additive lines in `fs/Makefile` (`fs_context.o fs_parser.o fs_types.o`), `include/linux/fs.h`, `include/net/addrconf.h`, and `drivers/usb/core/hub.c`
+#    - Reverts clean-merged `fs/ext4/*` and `fs/f2fs/*` files to HEAD if they call symbols (like `ITAIL`) that conflict with Samsung's OneUI filesystem drivers
+# 4. Verify whether Aria CI patches (.github/aria/*.diff) and KernelSU apply cleanly after the CIP merge.
+# 5. Run a full Neutron Clang compilation test (with `-k` keep-going diagnostics on failure) and optionally package `Image` + `dtb.img`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel tree (owner/name)'
+        default: 'Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850'
+      kernel_branch:
+        description: 'Kernel tree branch/tag/commit'
+        default: 'lineage-24.0'
+      cip_ref:
+        description: 'CIP branch or tag to test merge against'
+        type: choice
+        options:
+          - linux-4.19.y-st-rc
+          - linux-4.19.y-st
+          - linux-4.19.y-cip
+          - linux-4.19.y-cip-rebase
+        default: 'linux-4.19.y-st-rc'
+      cip_custom_tag:
+        description: 'Optional exact CIP tag/commit (e.g. v4.19-st20 or v4.19.325-cip136, overrides cip_ref if set)'
+        default: ''
+      conflict_strategy:
+        description: 'How to handle merge conflicts during diagnostic build'
+        type: choice
+        options:
+          - smart_exynos850_and_build
+          - auto_ours_and_build
+          - diagnose_only
+          - auto_theirs_and_build
+          - fail_on_conflict
+        default: 'smart_exynos850_and_build'
+      keep_samsung_fs_subsystems:
+        description: 'Keep Samsung/OneUI fs/ext4 & fs/f2fs intact (prevents ITAIL / f2fs_msg build errors from partial CIP merges)'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      strip_cip_localversion:
+        description: 'Remove localversion-st / localversion-cip after merge (Rissu A12s style)'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      run_compile_test:
+        description: 'Run Clang kernel compilation check'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      upload_built_image:
+        description: 'Upload compiled Image and dtb.img artifact if build succeeds'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      defconfig:
+        description: 'Kernel defconfig'
+        default: 'exynos850-a13nsxx_defconfig'
+      selinux:
+        description: 'SELinux mode for patch/build check'
+        type: choice
+        options: [enforcing, permissive]
+        default: enforcing
+      freq_method:
+        description: 'Frequency patch set to verify (minimal | full)'
+        type: choice
+        options: [minimal, full]
+        default: minimal
+      cpu_freq_mode:
+        description: 'CPU frequency mode for patch check (stock | uc | oc)'
+        type: choice
+        options: [stock, uc, oc]
+        default: stock
+      gpu_freq_mode:
+        description: 'GPU frequency mode for patch check (stock | oc)'
+        type: choice
+        options: [stock, oc]
+        default: stock
+      cpu_idle_teo:
+        description: 'Apply & verify pkenti TEO idle patch'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      pkenti_config:
+        description: 'Apply pkenti defconfig changes (BBR, fq_codel, HZ 300)'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      physwizz_config:
+        description: 'Apply physwizz defconfig changes (LZ4, kprobes off, stackprotector-strong off)'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      cpu_governor:
+        description: 'Default CPU governor'
+        type: choice
+        options: [schedutil, ondemand, energystep, conservative, performance, powersave, userspace]
+        default: schedutil
+      ksu_repo:
+        description: 'KernelSU repository (owner/name)'
+        default: 'backslashxx/KernelSU'
+      ksu_ref:
+        description: 'KernelSU tag or commit (empty = default branch HEAD)'
+        default: ''
+      ksu_hook:
+        description: 'KernelSU hook method'
+        type: choice
+        options: [branch_link, syscall_table]
+        default: branch_link
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-build-cip-${{ github.ref }}-${{ github.event.inputs.kernel_repo }}-${{ github.event.inputs.cip_ref }}
+  cancel-in-progress: true
+
+env:
+  ARCH: arm64
+  OUT: out
+  KNAME: Aria
+  ARIA_CI: ${{ github.workspace }}/ci
+  DIAG_DIR: ${{ github.workspace }}/cip-diagnostics
+  CIP_GIT_URL: https://git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip.git
+  KERNEL_REPO: ${{ github.event.inputs.kernel_repo || 'Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850' }}
+  KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-24.0' }}
+  CIP_REF: ${{ github.event.inputs.cip_ref || 'linux-4.19.y-st-rc' }}
+  CIP_CUSTOM_TAG: ${{ github.event.inputs.cip_custom_tag || '' }}
+  CONFLICT_STRATEGY: ${{ github.event.inputs.conflict_strategy || 'smart_exynos850_and_build' }}
+  KEEP_SAMSUNG_FS: ${{ github.event.inputs.keep_samsung_fs_subsystems || 'true' }}
+  STRIP_CIP_LOCALVERSION: ${{ github.event.inputs.strip_cip_localversion || 'true' }}
+  RUN_COMPILE_TEST: ${{ github.event.inputs.run_compile_test || 'true' }}
+  UPLOAD_BUILT_IMAGE: ${{ github.event.inputs.upload_built_image || 'true' }}
+  DEFCONFIG: ${{ github.event.inputs.defconfig || 'exynos850-a13nsxx_defconfig' }}
+  SELINUX: ${{ github.event.inputs.selinux || 'enforcing' }}
+  FREQ_METHOD: ${{ github.event.inputs.freq_method || 'minimal' }}
+  CPU_FREQ_MODE: ${{ github.event.inputs.cpu_freq_mode || 'stock' }}
+  GPU_FREQ_MODE: ${{ github.event.inputs.gpu_freq_mode || 'stock' }}
+  CPU_IDLE_TEO: ${{ github.event.inputs.cpu_idle_teo || 'true' }}
+  PKENTI_CONFIG: ${{ github.event.inputs.pkenti_config || 'true' }}
+  PHYSWIZZ_CONFIG: ${{ github.event.inputs.physwizz_config || 'true' }}
+  CPU_GOVERNOR: ${{ github.event.inputs.cpu_governor || 'schedutil' }}
+  KSU_REPO: ${{ github.event.inputs.ksu_repo || 'backslashxx/KernelSU' }}
+  KSU_REF: ${{ github.event.inputs.ksu_ref || '' }}
+  KSU_HOOK: ${{ github.event.inputs.ksu_hook || 'branch_link' }}
+
+jobs:
+  diagnose-cip-merge:
+    name: CIP Merge & Build (${{ github.event.inputs.cip_custom_tag || github.event.inputs.cip_ref || 'linux-4.19.y-st-rc' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: kernel
+
+    steps:
+      - name: Checkout Aria CI files (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Prepare diagnostic output directory
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p "$DIAG_DIR"
+
+      - name: Clone kernel tree (full blob history for 3-way merge)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          echo "::group::Cloning ${KERNEL_REPO} @ ${KERNEL_BRANCH}"
+          git clone --single-branch --branch "${KERNEL_BRANCH}" "https://github.com/${KERNEL_REPO}.git" kernel || {
+            rm -rf kernel
+            git clone "https://github.com/${KERNEL_REPO}.git" kernel
+            git -C kernel checkout --force "${KERNEL_BRANCH}"
+          }
+          echo "::endgroup::"
+
+          cd kernel
+          git config user.name "Aria CIP Diagnostic Bot"
+          git config user.email "actions@github.com"
+
+          grep -q '^PATCHLEVEL = 19' Makefile || { echo "::error::Not a Linux 4.19 kernel tree"; exit 1; }
+
+          KVER="$(awk '/^VERSION =/{v=$3} /^PATCHLEVEL =/{p=$3} /^SUBLEVEL =/{s=$3} END{printf "%s.%s.%s", v, p, s}' Makefile)"
+          LV_ST="$(cat localversion-st 2>/dev/null || echo 'none')"
+          LV_CIP="$(cat localversion-cip 2>/dev/null || echo 'none')"
+          HEAD_SHA="$(git rev-parse HEAD)"
+
+          {
+            echo "## 1. Kernel Tree Baseline"
+            echo "| Property | Value |"
+            echo "| :--- | :--- |"
+            echo "| **Repository** | \`${KERNEL_REPO}\` |"
+            echo "| **Branch / Ref** | \`${KERNEL_BRANCH}\` (\`${HEAD_SHA:0:12}\`) |"
+            echo "| **Makefile Version** | \`${KVER}\` |"
+            echo "| **Current \`localversion-st\`** | \`${LV_ST}\` |"
+            echo "| **Current \`localversion-cip\`** | \`${LV_CIP}\` |"
+            echo ""
+          } | tee -a "$DIAG_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch CIP branches & compare `-st`, `-st-rc`, and `-cip`
+        run: |
+          set -euo pipefail
+          TARGET_REF="${CIP_CUSTOM_TAG:-$CIP_REF}"
+          echo "::group::Fetching linux-cip branches from kernel.org"
+          git remote add cip "$CIP_GIT_URL"
+          git fetch --no-tags cip \
+            "+refs/heads/linux-4.19.y-st-rc:refs/remotes/cip/linux-4.19.y-st-rc" \
+            "+refs/heads/linux-4.19.y-st:refs/remotes/cip/linux-4.19.y-st" \
+            "+refs/heads/linux-4.19.y-cip:refs/remotes/cip/linux-4.19.y-cip"
+
+          if [ -n "$CIP_CUSTOM_TAG" ]; then
+            git fetch cip "refs/tags/${CIP_CUSTOM_TAG}:refs/tags/${CIP_CUSTOM_TAG}" || git fetch cip "${CIP_CUSTOM_TAG}"
+            MERGE_TARGET="FETCH_HEAD"
+          else
+            MERGE_TARGET="cip/${CIP_REF}"
+          fi
+          echo "MERGE_TARGET=${MERGE_TARGET}" >> "$GITHUB_ENV"
+          echo "TARGET_LABEL=${TARGET_REF}" >> "$GITHUB_ENV"
+          echo "::endgroup::"
+
+          ST_RC_SHA="$(git rev-parse --short=12 cip/linux-4.19.y-st-rc)"
+          ST_SHA="$(git rev-parse --short=12 cip/linux-4.19.y-st)"
+          CIP_SHA="$(git rev-parse --short=12 cip/linux-4.19.y-cip)"
+
+          ST_RC_LV="$(git show cip/linux-4.19.y-st-rc:localversion-st 2>/dev/null || echo 'none')"
+          ST_LV="$(git show cip/linux-4.19.y-st:localversion-st 2>/dev/null || echo 'none')"
+          CIP_LV_ST="$(git show cip/linux-4.19.y-cip:localversion-st 2>/dev/null || echo 'none')"
+          CIP_LV_CIP="$(git show cip/linux-4.19.y-cip:localversion-cip 2>/dev/null || echo 'none')"
+
+          MERGE_BASE="$(git merge-base HEAD "$MERGE_TARGET" || echo 'none')"
+          if [ "$MERGE_BASE" != "none" ]; then
+            MB_SHORT="${MERGE_BASE:0:12}"
+            MB_SUBJECT="$(git log -1 --format='%s (%ci)' "$MERGE_BASE")"
+            AHEAD_COUNT="$(git rev-list --count "${MERGE_BASE}..HEAD")"
+            BEHIND_COUNT="$(git rev-list --count "HEAD..${MERGE_TARGET}")"
+          else
+            MB_SHORT="none (unrelated histories!)"
+            MB_SUBJECT="N/A"
+            AHEAD_COUNT="?"
+            BEHIND_COUNT="?"
+          fi
+
+          {
+            echo "## 2. CIP Branch Comparison & Divergence"
+            echo "| CIP Branch | HEAD Commit | \`localversion-st\` | \`localversion-cip\` | Role |"
+            echo "| :--- | :--- | :--- | :--- | :--- |"
+            echo "| \`linux-4.19.y-st-rc\` | \`${ST_RC_SHA}\` | \`${ST_RC_LV}\` | *(absent)* | Bleeding-edge ST RC (5.4/5.10 LTS backports staging) |"
+            echo "| \`linux-4.19.y-st\` | \`${ST_SHA}\` | \`${ST_LV}\` | *(absent)* | Official Stable-Tree release (used by Rissu on A12s) |"
+            echo "| \`linux-4.19.y-cip\` | \`${CIP_SHA}\` | \`${CIP_LV_ST}\` | \`${CIP_LV_CIP}\` | Full CIP release (\`-st\` + CIP industrial config/driver patches) |"
+            echo ""
+            echo "- **Selected Target to Merge**: \`${TARGET_REF}\` (\`$(git rev-parse --short=12 "$MERGE_TARGET")\`)"
+            echo "- **Common Ancestor (Merge Base)**: \`${MB_SHORT}\` — ${MB_SUBJECT}"
+            echo "- **Divergence**: Kernel tree has **${AHEAD_COUNT}** device/vendor commits since merge-base; \`${TARGET_REF}\` has **${BEHIND_COUNT}** new upstream commits to merge."
+            echo ""
+          } | tee -a "$DIAG_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+          git log --oneline --no-merges "HEAD..${MERGE_TARGET}" > "$DIAG_DIR/incoming-cip-commits.txt" || true
+
+      - name: Analyze CIP merge & resolve conflicts (${{ github.event.inputs.conflict_strategy || 'smart_exynos850_and_build' }})
+        id: cip_merge
+        run: |
+          set -euo pipefail
+          ORIG_HEAD="$(git rev-parse HEAD)"
+          echo "::group::Testing git merge --no-commit --no-ff ${MERGE_TARGET}"
+          MERGE_EXIT=0
+          git merge --no-commit --no-ff "$MERGE_TARGET" > "$DIAG_DIR/merge-stdout.log" 2> "$DIAG_DIR/merge-stderr.log" || MERGE_EXIT=$?
+          cat "$DIAG_DIR/merge-stdout.log" "$DIAG_DIR/merge-stderr.log" || true
+          echo "::endgroup::"
+
+          if [ "$MERGE_EXIT" -ge 128 ]; then
+            echo "::error::git merge aborted with a fatal git error (exit $MERGE_EXIT). See merge-stderr.log."
+            git reset --hard "$ORIG_HEAD" || true
+            exit "$MERGE_EXIT"
+          fi
+
+          if [ "$MERGE_EXIT" -eq 0 ]; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            if [ "$STRIP_CIP_LOCALVERSION" = "true" ]; then
+              rm -f localversion-st localversion-cip .gitlab-ci.yml
+              git rm --ignore-unmatch -f localversion-st localversion-cip .gitlab-ci.yml >/dev/null 2>&1 || true
+            fi
+            git diff --cached --stat > "$DIAG_DIR/clean-merge-diffstat.txt"
+            git commit -m "Merge ${TARGET_LABEL} into ${KERNEL_BRANCH}"
+            {
+              echo "## 3. Merge Conflict Analysis: ✅ CLEAN MERGE"
+              echo "\`${TARGET_LABEL}\` merged cleanly into \`${KERNEL_REPO}@${KERNEL_BRANCH}\` with **0 conflicts**."
+              echo ""
+            } | tee -a "$DIAG_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > "$DIAG_DIR/conflicted-files.txt"
+            CONFLICT_COUNT="$(wc -l < "$DIAG_DIR/conflicted-files.txt" | tr -d ' ')"
+
+            git diff > "$DIAG_DIR/conflict-markers.diff" || true
+            git status > "$DIAG_DIR/git-status-conflict.txt" || true
+
+            {
+              echo "## 3. Merge Conflict Analysis: ⚠️ ${CONFLICT_COUNT} CONFLICTING FILE(S) (Strategy: \`${CONFLICT_STRATEGY}\`)"
+              echo "Merging \`${TARGET_LABEL}\` into \`${KERNEL_REPO}@${KERNEL_BRANCH}\` produced **${CONFLICT_COUNT}** unmerged file(s):"
+              echo ""
+              echo "| Conflicted File | Subsystem | Conflict Hunks / Type | Last Vendor/Device Commit Touching File | Incoming CIP Commit Touching File |"
+              echo "| :--- | :--- | :--- | :--- | :--- |"
+            } > "$DIAG_DIR/conflict-table.md"
+
+            while IFS= read -r cfile; do
+              [ -n "$cfile" ] || continue
+              SUBSYS="$(echo "$cfile" | cut -d/ -f1-2)"
+              if ! git cat-file -e "HEAD:${cfile}" 2>/dev/null; then
+                HUNKS="modify/delete (deleted in HEAD)"
+              else
+                HCNT="$(grep -c '^<<<<<<< ' "$cfile" 2>/dev/null || true)"
+                HUNKS="${HCNT:-1} hunk(s)"
+              fi
+              OURS_LOG="$(git log -1 --format='`%h` %s' HEAD -- "$cfile" 2>/dev/null | tr '|' '/' || echo 'N/A')"
+              THEIRS_LOG="$(git log -1 --format='`%h` %s' "HEAD..${MERGE_TARGET}" -- "$cfile" 2>/dev/null | tr '|' '/' || echo 'N/A')"
+              echo "| \`${cfile}\` | \`${SUBSYS}\` | ${HUNKS} | ${OURS_LOG} | ${THEIRS_LOG} |" >> "$DIAG_DIR/conflict-table.md"
+
+              {
+                echo "================================================================================"
+                echo "FILE: $cfile ($HUNKS)"
+                echo "--- Device/Vendor commits since merge-base (OURS) ---"
+                git log --oneline "$(git merge-base HEAD "$MERGE_TARGET")..HEAD" -- "$cfile" || true
+                echo "--- Incoming CIP commits (THEIRS) ---"
+                git log --oneline "HEAD..${MERGE_TARGET}" -- "$cfile" || true
+                echo "================================================================================"
+                echo ""
+              } >> "$DIAG_DIR/per-file-conflict-history.txt"
+            done < "$DIAG_DIR/conflicted-files.txt"
+
+            cat "$DIAG_DIR/conflict-table.md" | tee -a "$DIAG_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+
+            case "$CONFLICT_STRATEGY" in
+              fail_on_conflict)
+                git merge --abort || git reset --hard "$ORIG_HEAD"
+                echo "::error::CIP merge failed with ${CONFLICT_COUNT} conflicted files."
+                exit 1
+                ;;
+              diagnose_only)
+                echo "Aborting in-progress merge to restore clean tree..."
+                git merge --abort || git reset --hard "$ORIG_HEAD"
+                ;;
+              auto_ours_and_build)
+                echo "::warning::Auto-resolving conflicts using -X ours..."
+                git merge --abort || git reset --hard "$ORIG_HEAD"
+                git merge --no-commit -X ours "$MERGE_TARGET" || true
+                # Also resolve modify/delete conflicts where HEAD deleted the file
+                while IFS= read -r ufile; do
+                  [ -n "$ufile" ] || continue
+                  if ! git cat-file -e "HEAD:${ufile}" 2>/dev/null; then
+                    git rm -f "$ufile"
+                  else
+                    git checkout --ours -- "$ufile"
+                    git add "$ufile"
+                  fi
+                done < <(git diff --name-only --diff-filter=U)
+                if [ "$STRIP_CIP_LOCALVERSION" = "true" ]; then
+                  git rm --ignore-unmatch -f localversion-st localversion-cip .gitlab-ci.yml >/dev/null 2>&1 || true
+                fi
+                git commit -m "Merge ${TARGET_LABEL} (auto-ours)"
+                ;;
+              auto_theirs_and_build)
+                echo "::warning::Auto-resolving conflicts using -X theirs..."
+                git merge --abort || git reset --hard "$ORIG_HEAD"
+                git merge --no-commit -X theirs "$MERGE_TARGET" || true
+                while IFS= read -r ufile; do
+                  [ -n "$ufile" ] || continue
+                  git checkout --theirs -- "$ufile" || git rm -f "$ufile"
+                  git add "$ufile" 2>/dev/null || true
+                done < <(git diff --name-only --diff-filter=U)
+                if [ "$STRIP_CIP_LOCALVERSION" = "true" ]; then
+                  git rm --ignore-unmatch -f localversion-st localversion-cip .gitlab-ci.yml >/dev/null 2>&1 || true
+                fi
+                git commit -m "Merge ${TARGET_LABEL} (auto-theirs)"
+                ;;
+              smart_exynos850_and_build)
+                echo "::group::Applying Smart Exynos850 CIP Conflict Resolution"
+                # 1. Resolve all unmerged files:
+                #    - If deleted in HEAD (e.g. non-Samsung DTS, tg3.c, tools/spi/.gitignore), keep deleted (`git rm -f`)
+                #    - Otherwise start from HEAD (`git checkout --ours`) to preserve Exynos850 drivers, Android KABI, & 5.4/5.10 backports
+                while IFS= read -r cfile; do
+                  [ -n "$cfile" ] || continue
+                  if ! git cat-file -e "HEAD:${cfile}" 2>/dev/null; then
+                    echo "  [modify/delete -> rm] $cfile"
+                    git rm -f "$cfile"
+                  else
+                    echo "  [content -> ours]     $cfile"
+                    git checkout --ours -- "$cfile"
+                    git add "$cfile"
+                  fi
+                done < "$DIAG_DIR/conflicted-files.txt"
+
+                # 2. Additive fixups where incoming CIP commits in OTHER clean-merged files depend on new headers/objects:
+                #    (a) fs/Makefile: CIP commit bd82c675967d ("fs: common implementation of file type") adds fs_types.o
+                if [ -f fs/fs_types.c ] && ! grep -q 'fs_types\.o' fs/Makefile; then
+                  echo "  [additive fix] Adding fs_types.o to fs/Makefile"
+                  sed -i 's/fs_context\.o fs_parser\.o/fs_context.o fs_parser.o fs_types.o/' fs/Makefile
+                  git add fs/Makefile
+                fi
+
+                #    (b) include/linux/fs.h: CIP commit bd82c675967d adds #include <linux/fs_types.h>
+                if [ -f include/linux/fs_types.h ] && ! grep -q '<linux/fs_types\.h>' include/linux/fs.h; then
+                  echo "  [additive fix] Adding #include <linux/fs_types.h> to include/linux/fs.h"
+                  sed -i '/#include <linux\/android_kabi\.h>/a #include <linux/fs_types.h>' include/linux/fs.h
+                  git add include/linux/fs.h
+                fi
+
+                #    (c) include/net/addrconf.h: CIP commit d289479f070a adds in6_dev_hold_safe() used by net/ipv6/mcast.c
+                if ! grep -q 'in6_dev_hold_safe' include/net/addrconf.h; then
+                  echo "  [additive fix] Adding in6_dev_hold_safe() helper to include/net/addrconf.h"
+                  python3 -c '
+                p = "include/net/addrconf.h"
+                s = open(p).read()
+                target = "static inline void in6_dev_hold(struct inet6_dev *idev)\n{\n\trefcount_inc(&idev->refcnt);\n}\n"
+                replacement = target + "\nstatic inline bool in6_dev_hold_safe(struct inet6_dev *idev)\n{\n\treturn refcount_inc_not_zero(&idev->refcnt);\n}\n"
+                if target in s:
+                    open(p, "w").write(s.replace(target, replacement, 1))
+                '
+                  git add include/net/addrconf.h
+                fi
+
+                #    (d) drivers/usb/core/hub.c: CIP commit e11bcf49b050 uses USB_SS_PORT_U0_WAKE_TIME
+                if ! grep -q 'USB_SS_PORT_U0_WAKE_TIME' drivers/usb/core/hub.c; then
+                  echo "  [additive fix] Adding USB_SS_PORT_U0_WAKE_TIME macro to drivers/usb/core/hub.c"
+                  sed -i '/extern int deny_new_usb;/a #define USB_SS_PORT_U0_WAKE_TIME\t200  /* ms */' drivers/usb/core/hub.c
+                  git add drivers/usb/core/hub.c
+                fi
+
+                # 3. Keep Samsung's OneUI fs/ext4 and fs/f2fs coherent (prevents half-merged ITAIL / f2fs_msg build errors)
+                #    Notice in your tree history: commit 3098795d84e5 ('Revert "fs: ext4: Update from CIP"')
+                if [ "$KEEP_SAMSUNG_FS" = "true" ]; then
+                  echo "  [subsystem coherence] Restoring Samsung OneUI fs/ext4, fs/f2fs, and drivers/usb/dwc3 to HEAD"
+                  git checkout "$ORIG_HEAD" -- fs/ext4 fs/f2fs drivers/usb/dwc3
+                  git add fs/ext4 fs/f2fs drivers/usb/dwc3
+                fi
+
+                # 4. Strip CIP localversion files if requested (Rissu A12s style)
+                if [ "$STRIP_CIP_LOCALVERSION" = "true" ]; then
+                  rm -f localversion-st localversion-cip .gitlab-ci.yml
+                  git rm --ignore-unmatch -f localversion-st localversion-cip .gitlab-ci.yml >/dev/null 2>&1 || true
+                fi
+
+                git diff --cached --stat > "$DIAG_DIR/smart-merge-diffstat.txt"
+                git commit -m "Merge ${TARGET_LABEL} into ${KERNEL_BRANCH} (Smart Exynos850 resolution)"
+                echo "::endgroup::"
+                ;;
+            esac
+          fi
+
+      - name: Check & apply Aria CI patches and KernelSU
+        run: |
+          set -euo pipefail
+          D="$ARIA_CI/.github/aria"
+          {
+            echo "## 4. Aria CI Patch & KernelSU Check"
+            echo "| Patch / Component | Status | Notes |"
+            echo "| :--- | :--- | :--- |"
+          } > "$DIAG_DIR/patch-check.md"
+
+          check_patch() {
+            local name="$1"
+            local patch_file="$2"
+            if [ ! -f "$patch_file" ]; then
+              echo "| \`${name}\` | ⚠️ Missing | File not found in \`.github/aria/\` |" >> "$DIAG_DIR/patch-check.md"
+              return 0
+            fi
+            if git apply --check "$patch_file" 2>"$DIAG_DIR/patch-err-${name}.log"; then
+              echo "| \`${name}\` | ✅ Clean | Applies cleanly |" >> "$DIAG_DIR/patch-check.md"
+              rm -f "$DIAG_DIR/patch-err-${name}.log"
+            elif git apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+              echo "| \`${name}\` | ℹ️ Already Applied | Already present in kernel tree |" >> "$DIAG_DIR/patch-check.md"
+            else
+              ERR_MSG="$(head -n 3 "$DIAG_DIR/patch-err-${name}.log" | tr '\n' ' ' | tr '|' '/')"
+              echo "| \`${name}\` | ❌ Conflict | \`${ERR_MSG}\` |" >> "$DIAG_DIR/patch-check.md"
+            fi
+          }
+
+          if grep -q 'int path_umount' fs/namespace.c; then
+            echo "| \`path-umount.diff\` | ℹ️ Already Applied | \`int path_umount\` already present in \`fs/namespace.c\` |" >> "$DIAG_DIR/patch-check.md"
+          else
+            check_patch "path-umount.diff" "$D/path-umount.diff"
+          fi
+
+          check_patch "pkenti-core.diff" "$D/pkenti-core.diff"
+          check_patch "pkenti-dts-cpu.diff" "$D/pkenti-dts-cpu.diff"
+          check_patch "pkenti-dts-gpu.diff" "$D/pkenti-dts-gpu.diff"
+          check_patch "pkenti-gpu-pm.diff" "$D/pkenti-gpu-pm.diff"
+          check_patch "a12s-dts-gpu.diff" "$D/a12s-dts-gpu.diff"
+          check_patch "pkenti-teo.diff" "$D/pkenti-teo.diff"
+          check_patch "selinux-always-permissive.diff" "$D/selinux-always-permissive.diff"
+
+          cat "$DIAG_DIR/patch-check.md" | tee -a "$DIAG_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install build dependencies & Neutron Clang
+        if: ${{ env.RUN_COMPILE_TEST == 'true' && (steps.cip_merge.outputs.conflict == 'false' || env.CONFLICT_STRATEGY != 'diagnose_only') }}
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu \
+            lz4 zstd cpio rsync xz-utils zip unzip curl git python3
+
+          mkdir -p "$HOME/toolchains/neutron-clang"
+          cd "$HOME/toolchains/neutron-clang"
+          curl -fsSLO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S
+          echo "$HOME/toolchains/neutron-clang/bin" >> "$GITHUB_PATH"
+
+      - name: Configure & Build Kernel with Aria Tweaks (with `-k` error collection)
+        id: build_test
+        if: ${{ env.RUN_COMPILE_TEST == 'true' && (steps.cip_merge.outputs.conflict == 'false' || env.CONFLICT_STRATEGY != 'diagnose_only') }}
+        run: |
+          set -euo pipefail
+          # 1. KernelSU setup
+          rm -rf KernelSU
+          git clone "https://github.com/${KSU_REPO}.git" KernelSU
+          REF="${KSU_REF:-$(git -C KernelSU symbolic-ref --short HEAD)}"
+          bash KernelSU/kernel/setup.sh "$REF"
+
+          D="arch/arm64/configs/${DEFCONFIG}"
+          sed -i '/^CONFIG_KSU/d;/^# CONFIG_KSU/d' "$D"
+          {
+            echo ''
+            echo '# KernelSU (backslashxx)'
+            echo 'CONFIG_KSU=y'
+            if [ "$KSU_HOOK" = "syscall_table" ]; then
+              echo 'CONFIG_KSU_TAMPER_SYSCALL_TABLE=y'
+            else
+              echo 'CONFIG_KSU_HACK_ARM64_BRANCH_LINK=y'
+            fi
+          } >> "$D"
+          sed -i "s/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"-${KNAME}\"/" "$D"
+
+          # 2. path_umount backport
+          if ! grep -q 'int path_umount' fs/namespace.c && [ -f "$ARIA_CI/.github/aria/path-umount.diff" ]; then
+            git apply --verbose "$ARIA_CI/.github/aria/path-umount.diff"
+          fi
+
+          # 3. pkenti defconfig changes
+          if [ "$PKENTI_CONFIG" = "true" ] && [ -f "$ARIA_CI/.github/aria/pkenti.config" ]; then
+            grep -E '^(CONFIG_|# CONFIG_)' "$ARIA_CI/.github/aria/pkenti.config" > /tmp/pkenti.lines
+            while IFS= read -r line; do
+              opt="$(echo "$line" | sed -E 's/^# (CONFIG_[A-Za-z0-9_]+) is not set$/\1/; s/^(CONFIG_[A-Za-z0-9_]+)=.*/\1/')"
+              sed -i "/^${opt}=/d;/^# ${opt} is not set/d" "$D"
+            done < /tmp/pkenti.lines
+            { echo ''; echo '# pkenti'; cat /tmp/pkenti.lines; } >> "$D"
+          fi
+
+          # 4. Traffic control options
+          sed -i '/^CONFIG_NET_CLS_MATCHALL=/d;/^# CONFIG_NET_CLS_MATCHALL is not set/d;/^CONFIG_NET_ACT_BPF=/d;/^# CONFIG_NET_ACT_BPF is not set/d' "$D"
+          printf '\nCONFIG_NET_CLS_MATCHALL=y\nCONFIG_NET_ACT_BPF=y\n' >> "$D"
+
+          # 5. CPU governors
+          GOVS="PERFORMANCE POWERSAVE USERSPACE ONDEMAND CONSERVATIVE SCHEDUTIL ENERGYSTEP"
+          for g in $GOVS; do
+            sed -i "/^CONFIG_CPU_FREQ_GOV_${g}=/d;/^# CONFIG_CPU_FREQ_GOV_${g} is not set/d" "$D"
+            sed -i "/^CONFIG_CPU_FREQ_DEFAULT_GOV_${g}=/d;/^# CONFIG_CPU_FREQ_DEFAULT_GOV_${g} is not set/d" "$D"
+          done
+          DEF="$(echo "$CPU_GOVERNOR" | tr a-z A-Z)"
+          {
+            echo ''
+            echo '# CPU governors'
+            for g in $GOVS; do
+              echo "CONFIG_CPU_FREQ_GOV_${g}=y"
+              if [ "$g" = "$DEF" ]; then echo "CONFIG_CPU_FREQ_DEFAULT_GOV_${g}=y"
+              else echo "# CONFIG_CPU_FREQ_DEFAULT_GOV_${g} is not set"; fi
+            done
+          } >> "$D"
+
+          # 6. physwizz defconfig changes
+          if [ "$PHYSWIZZ_CONFIG" = "true" ]; then
+            sed -i '/^CONFIG_CRYPTO_LZ4=/d;/^# CONFIG_CRYPTO_LZ4 is not set/d;/^CONFIG_CRYPTO_LZO=/d;/^# CONFIG_CRYPTO_LZO is not set/d' "$D"
+            sed -i '/^CONFIG_KPROBES=/d;/^# CONFIG_KPROBES is not set/d;/^CONFIG_KPROBE_EVENTS=/d;/^# CONFIG_KPROBE_EVENTS is not set/d' "$D"
+            sed -i '/^CONFIG_STACKPROTECTOR_STRONG=/d;/^# CONFIG_STACKPROTECTOR_STRONG is not set/d' "$D"
+            sed -i '/^CONFIG_LOCALVERSION_AUTO=/d;/^# CONFIG_LOCALVERSION_AUTO is not set/d' "$D"
+            {
+              echo ''
+              echo '# physwizz'
+              echo 'CONFIG_CRYPTO_LZ4=y'
+              echo '# CONFIG_KPROBES is not set'
+              echo '# CONFIG_KPROBE_EVENTS is not set'
+              echo '# CONFIG_STACKPROTECTOR_STRONG is not set'
+              echo '# CONFIG_LOCALVERSION_AUTO is not set'
+            } >> "$D"
+          fi
+
+          # 7. TEO idle governor
+          if [ "$CPU_IDLE_TEO" = "true" ] && [ -f "$ARIA_CI/.github/aria/pkenti-teo.diff" ]; then
+            git apply --verbose "$ARIA_CI/.github/aria/pkenti-teo.diff"
+            sed -i '/^CONFIG_CPU_IDLE_GOV_TEO=/d;/^# CONFIG_CPU_IDLE_GOV_TEO is not set/d' "$D"
+            echo 'CONFIG_CPU_IDLE_GOV_TEO=y' >> "$D"
+          fi
+
+          # 8. SELinux mode
+          sed -i '/^CONFIG_SECURITY_SELINUX_ALWAYS_\(PERMISSIVE\|ENFORCE\)/d;/^# CONFIG_SECURITY_SELINUX_ALWAYS_\(PERMISSIVE\|ENFORCE\)/d' "$D"
+          if [ "$SELINUX" = "permissive" ]; then
+            git apply --verbose "$ARIA_CI/.github/aria/selinux-always-permissive.diff"
+            echo 'CONFIG_SECURITY_SELINUX_ALWAYS_PERMISSIVE=y' >> "$D"
+            echo '# CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE is not set' >> "$D"
+          else
+            echo '# CONFIG_SECURITY_SELINUX_ALWAYS_PERMISSIVE is not set' >> "$D"
+            echo '# CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE is not set' >> "$D"
+          fi
+
+          # 9. Configure & Compile
+          make -j"$(nproc)" ARCH="$ARCH" O="$OUT" LLVM=1 LLVM_IAS=1 KCFLAGS=-w CROSS_COMPILE=aarch64-linux-gnu- \
+            PLATFORM_VERSION=14 ANDROID_MAJOR_VERSION=14 \
+            KBUILD_BUILD_USER=aria KBUILD_BUILD_HOST=github "$DEFCONFIG"
+
+          BUILD_EXIT=0
+          make -j"$(nproc)" -k ARCH="$ARCH" O="$OUT" LLVM=1 LLVM_IAS=1 KCFLAGS=-w CROSS_COMPILE=aarch64-linux-gnu- \
+            PLATFORM_VERSION=14 ANDROID_MAJOR_VERSION=14 \
+            KBUILD_BUILD_USER=aria KBUILD_BUILD_HOST=github Image dtbs 2>&1 | tee "$DIAG_DIR/build.log" || BUILD_EXIT=$?
+
+          grep -E '(^| )error:|undefined reference to|implicit declaration of function' "$DIAG_DIR/build.log" > "$DIAG_DIR/compiler-errors.txt" || true
+
+          if [ "$BUILD_EXIT" -eq 0 ]; then
+            echo "build_success=true" >> "$GITHUB_OUTPUT"
+            DTB="$(find "$OUT/arch/arm64/boot/dts" -name 'exynos3830.dtb' | head -n1)"
+            if [ -n "$DTB" ] && [ -f "$ARIA_CI/.github/aria/mkdtbimg.py" ]; then
+              python3 "$ARIA_CI/.github/aria/mkdtbimg.py" "$DTB" "$OUT/arch/arm64/boot/dtb.img"
+            fi
+            {
+              echo "## 5. Compile Diagnostic: ✅ BUILD SUCCEEDED"
+              echo "\`Image\` and \`dtb.img\` compiled cleanly after merging \`${TARGET_LABEL}\`!"
+            } | tee -a "$DIAG_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "build_success=false" >> "$GITHUB_OUTPUT"
+            ERR_LINES="$(wc -l < "$DIAG_DIR/compiler-errors.txt" | tr -d ' ')"
+            {
+              echo "## 5. Compile Diagnostic: ❌ BUILD FAILED (${ERR_LINES} error lines)"
+              echo "Top compiler/linker errors extracted from \`build.log\`:"
+              echo '```text'
+              head -n 45 "$DIAG_DIR/compiler-errors.txt"
+              echo '```'
+            } | tee -a "$DIAG_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+            exit "$BUILD_EXIT"
+          fi
+
+      - name: Upload Built Image & dtb.img (if CIP merge + build succeeded)
+        if: ${{ steps.build_test.outputs.build_success == 'true' && env.UPLOAD_BUILT_IMAGE == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aria-CIP-Image-${{ github.run_number }}
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/arch/arm64/boot/dtb.img
+          if-no-files-found: warn
+
+      - name: Upload CIP Conflict & Build Diagnostic Report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cip-merge-diagnostics-${{ github.run_number }}
+          path: ${{ env.DIAG_DIR }}/
+          if-no-files-found: warn
