@@ -1,0 +1,101 @@
+name: CIP / ST conflict check (dry run, builds nothing)
+
+# Answers one question: if the CIP "-st" or "-cip" release on top of 4.19.325 were merged into the kernel tree,
+# which files would conflict? Nothing is committed, nothing is built, the kernel tree is not changed.
+#   -st  = CIP's continued 4.19 stable maintenance after 4.19.325 (fixes taken from 5.4 stable)
+#   -cip = the -st tree plus board support for CIP platforms
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel tree (owner/name)'
+        default: 'Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850'
+      kernel_branch:
+        description: 'Kernel tree branch'
+        default: 'lineage-24.0'
+      st_tag:
+        description: 'CIP -st tag (falls back to the linux-4.19.y-st-rc branch if the tag does not exist)'
+        default: 'v4.19.325-st20'
+      cip_tag:
+        description: 'CIP -cip tag (falls back to the linux-4.19.y-cip branch if the tag does not exist)'
+        default: 'v4.19.325-cip136'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      KERNEL_REPO: ${{ github.event.inputs.kernel_repo }}
+      KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+      ST_TAG: ${{ github.event.inputs.st_tag }}
+      CIP_TAG: ${{ github.event.inputs.cip_tag }}
+    steps:
+      - name: Fetch the CIP refs and the kernel tree
+        run: |
+          set -euo pipefail
+          git --version
+          mkdir work && cd work && git init -q .
+          git remote add cip https://git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip.git
+          # commits only; file contents are fetched on demand by the merge
+          fetch_ref() {  # name, fallback-branch, local ref
+            if git fetch --filter=blob:none --no-tags cip "refs/tags/$1:refs/aria/$3" 2>/dev/null; then
+              echo "$3 = tag $1"
+            elif git fetch --filter=blob:none --no-tags cip "refs/heads/$1:refs/aria/$3" 2>/dev/null; then
+              echo "$3 = branch $1"
+            else
+              echo "::warning::$1 not found as tag or branch, using branch $2 instead"
+              git fetch --filter=blob:none --no-tags cip "refs/heads/$2:refs/aria/$3"
+              echo "$3 = branch $2 (fallback)"
+            fi
+          }
+          fetch_ref "$ST_TAG" linux-4.19.y-st-rc st
+          fetch_ref "$CIP_TAG" linux-4.19.y-cip cip
+          if ! git fetch --filter=blob:none --no-tags cip "refs/tags/v4.19.325:refs/aria/base"; then
+            git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+            git fetch --filter=blob:none --no-tags stable "refs/tags/v4.19.325:refs/aria/base"
+          fi
+          git remote add ours "https://github.com/${KERNEL_REPO}.git"
+          git fetch --depth=1 --no-tags ours "${KERNEL_BRANCH}:refs/aria/ours"
+          git rev-parse refs/aria/base refs/aria/st refs/aria/cip refs/aria/ours
+
+      - name: Dry-run three-way merge (st, then cip)
+        run: |
+          set -uo pipefail
+          cd work
+          {
+            echo "## CIP / ST conflict check"
+            echo "- kernel: \`${KERNEL_REPO}\` @ \`${KERNEL_BRANCH}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for T in st cip; do
+            OUT="merge-$T.txt"
+            CHANGED=$(git diff --name-only refs/aria/base "refs/aria/$T" | wc -l)
+            # base = plain 4.19.325, ours = your tree, theirs = the CIP tag; writes no refs, changes no files
+            git merge-tree --write-tree --name-only --messages \
+              --merge-base=refs/aria/base refs/aria/ours "refs/aria/$T" > "$OUT" 2> "err-$T.txt"
+            RC=$?
+            FILES=$(sed -n '2,/^$/p' "$OUT" | grep -v '^$' | wc -l)
+            echo "[$T] merge-tree exit=$RC, files changed by the tag: $CHANGED, conflicting files: $FILES"
+            {
+              echo ""
+              echo "### $T  ($( [ "$T" = st ] && echo "$ST_TAG" || echo "$CIP_TAG" ))"
+              echo "- files changed by the tag: $CHANGED"
+              if [ "$RC" -eq 0 ]; then echo "- **no conflicts**"; else echo "- **conflicting files: $FILES** (exit $RC)"; fi
+              echo ""
+              echo "Conflicts by top folder:"
+              echo '```'
+              sed -n '2,/^$/p' "$OUT" | grep -v '^$' | awk -F/ '{print $1"/"$2}' | sort | uniq -c | sort -rn | head -25
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload the reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: cip-st-conflict-report
+          path: |
+            work/merge-*.txt
+            work/err-*.txt
