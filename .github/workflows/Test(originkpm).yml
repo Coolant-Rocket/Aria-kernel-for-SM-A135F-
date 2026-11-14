@@ -1,0 +1,1174 @@
+name: Build Aria Kernel TEST CIP+Origin+KPM (A135F)
+
+# Aria - Samsung Galaxy A13 (SM-A135F, Exynos850), non-GKI 4.19.325 + Optional CIP (-st / -st-rc / -cip) Merge
+# Kernel tree: cloned from GitHub (inputs below)
+# KernelSU:    originsu (samakshkambxj/OriginSU + SuSFS 2.3.0 inline-hook / manual-hook + native KPM + Veil + Multi-Manager + optional NoMount)
+#              OR backslashxx (backslashxx/KernelSU, official kernel/setup.sh)
+# Output:      the kernel Image and dtb.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel tree (owner/name)'
+        default: 'Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850'
+      kernel_branch:
+        description: 'Kernel tree branch/tag/commit'
+        default: 'lineage-24.0'
+      cip_merge:
+        description: 'Merge Linux 4.19 CIP / ST upstream branch before building (none = stock tree)'
+        type: choice
+        options:
+          - linux-4.19.y-st-rc
+          - linux-4.19.y-st
+          - linux-4.19.y-cip
+          - none
+        default: 'linux-4.19.y-st-rc'
+      strip_cip_localversion:
+        description: 'Remove localversion-st / localversion-cip after CIP merge (Rissu A12s style)'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      ksu_variant:
+        description: 'KernelSU implementation: originsu (OriginSU + Veil + Multi-Manager) | backslashxx'
+        type: choice
+        options: [originsu, backslashxx]
+        default: originsu
+      susfs:
+        description: 'OriginSU only: Apply SuSFS 2.3.0 (4.19 non-GKI inline-hook backport; false = manual hook)'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      kpm:
+        description: 'OriginSU only: Enable OriginSU native KPM support (CONFIG_KPM=y)'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      nomount:
+        description: 'OriginSU only: Integrate vendored NoMount v2.2.0 VFS driver (CONFIG_NOMOUNT=y)'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      selinux:
+        description: 'SELinux mode of the built kernel'
+        type: choice
+        options: [enforcing, permissive]
+        default: enforcing
+      ksu_hook:
+        description: 'backslashxx only: KernelSU hook method (branch_link recommended on 4.19)'
+        type: choice
+        options: [branch_link, syscall_table]
+        default: branch_link
+      cpu_governor:
+        description: 'Default CPU governor (all governors are built in, switch any time at runtime)'
+        type: choice
+        options: [schedutil, ondemand, energystep, conservative, performance, powersave, userspace]
+        default: schedutil
+      physwizz_config:
+        description: 'physwizz defconfig changes (LZ4, kprobes off, stackprotector-strong off, no auto localversion)'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      freq_method:
+        description: 'Range method: minimal (a12s lineage: boot parameters + GPU rows, safest) | full (pkenti: also patches the firmware tables)'
+        type: choice
+        options: [minimal, full]
+        default: minimal
+      cpu_freq_mode:
+        description: 'CPU range: stock | uc 130-2002 MHz | oc 130-2210 MHz (minimal) or 130-2314 MHz (full)'
+        type: choice
+        options: [stock, uc, oc]
+        default: stock
+      cpu_undervolt_uv:
+        description: 'CPU undervolt in microvolts, both clusters (0 = off, e.g. 25000), kernel built-in margin method'
+        default: '0'
+      gpu_freq_mode:
+        description: 'GPU range: stock | oc up to 1196 MHz (full also lowers the minimum to 100 MHz)'
+        type: choice
+        options: [stock, oc]
+        default: stock
+      gpu_undervolt_uv:
+        description: 'GPU undervolt in microvolts (0 = off, e.g. 25000)'
+        default: '0'
+      cpu_idle_teo:
+        description: 'CPU idle: TEO governor (pkenti)'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      pkenti_config:
+        description: 'pkenti defconfig changes (BBR, fq_codel, HZ 300, debug off, ...)'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      release:
+        description: 'Publish Image and dtb.img as plain files in a GitHub Release'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      ksu_repo:
+        description: 'KernelSU repository override (empty = auto: samakshkambxj/OriginSU or backslashxx/KernelSU)'
+        default: ''
+      ksu_ref:
+        description: 'KernelSU branch, tag, or commit (empty = auto: main for OriginSU, latest default branch for backslashxx)'
+        default: ''
+      defconfig:
+        description: 'Kernel defconfig'
+        default: 'exynos850-a13nsxx_defconfig'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-aria-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARCH: arm64
+  OUT: out
+  KNAME: Aria
+  ARIA_CI: ${{ github.workspace }}/ci
+  CIP_GIT_URL: https://git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip.git
+  KERNEL_REPO: ${{ github.event.inputs.kernel_repo || 'Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850' }}
+  KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch || 'lineage-24.0' }}
+  CIP_MERGE: ${{ github.event.inputs.cip_merge || 'linux-4.19.y-st-rc' }}
+  STRIP_CIP_LOCALVERSION: ${{ github.event.inputs.strip_cip_localversion || 'true' }}
+  KSU_VARIANT: ${{ github.event.inputs.ksu_variant || 'originsu' }}
+  SUSFS: ${{ github.event.inputs.susfs || 'true' }}
+  KPM: ${{ github.event.inputs.kpm || 'true' }}
+  NOMOUNT: ${{ github.event.inputs.nomount || 'false' }}
+  SELINUX: ${{ github.event.inputs.selinux || 'enforcing' }}
+  KSU_HOOK: ${{ github.event.inputs.ksu_hook || 'branch_link' }}
+  CPU_GOVERNOR: ${{ github.event.inputs.cpu_governor || 'schedutil' }}
+  PHYSWIZZ_CONFIG: ${{ github.event.inputs.physwizz_config || 'true' }}
+  RELEASE: ${{ github.event.inputs.release || 'true' }}
+  FREQ_METHOD: ${{ github.event.inputs.freq_method || 'minimal' }}
+  CPU_FREQ_MODE: ${{ github.event.inputs.cpu_freq_mode || 'stock' }}
+  CPU_UV: ${{ github.event.inputs.cpu_undervolt_uv || '0' }}
+  GPU_UV: ${{ github.event.inputs.gpu_undervolt_uv || '0' }}
+  GPU_FREQ_MODE: ${{ github.event.inputs.gpu_freq_mode || 'stock' }}
+  CPU_IDLE_TEO: ${{ github.event.inputs.cpu_idle_teo || 'true' }}
+  PKENTI_CONFIG: ${{ github.event.inputs.pkenti_config || 'true' }}
+  KSU_REPO: ${{ github.event.inputs.ksu_repo }}
+  KSU_REF: ${{ github.event.inputs.ksu_ref }}
+  DEFCONFIG: ${{ github.event.inputs.defconfig || 'exynos850-a13nsxx_defconfig' }}
+
+jobs:
+  build:
+    name: Aria (${{ github.event.inputs.ksu_variant || 'originsu' }}, susfs=${{ github.event.inputs.susfs || 'true' }}, kpm=${{ github.event.inputs.kpm || 'true' }}, cip=${{ github.event.inputs.cip_merge || 'linux-4.19.y-st-rc' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: kernel
+
+    steps:
+      - name: Checkout Aria CI files (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Clone kernel tree
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          if [ "$CIP_MERGE" != "none" ]; then
+            git clone --single-branch --branch "${KERNEL_BRANCH}" "https://github.com/${KERNEL_REPO}.git" kernel || {
+              rm -rf kernel
+              git clone "https://github.com/${KERNEL_REPO}.git" kernel
+              git -C kernel checkout --force "${KERNEL_BRANCH}"
+            }
+          else
+            git clone --depth=1 --branch "${KERNEL_BRANCH}" "https://github.com/${KERNEL_REPO}.git" kernel || {
+              rm -rf kernel
+              git clone "https://github.com/${KERNEL_REPO}.git" kernel
+              git -C kernel checkout --force "${KERNEL_BRANCH}"
+            }
+          fi
+          cd kernel
+          git config user.name "Aria CI"
+          git config user.email "actions@github.com"
+          grep -q '^PATCHLEVEL = 19' Makefile || { echo "::error::not a 4.19 tree"; exit 1; }
+          { echo "### Kernel tree"; echo "- \`${KERNEL_REPO}\` @ \`${KERNEL_BRANCH}\` ($(git rev-parse HEAD))"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Merge CIP branch (${{ github.event.inputs.cip_merge || 'linux-4.19.y-st-rc' }}) with Smart Exynos850 Resolution
+        if: ${{ env.CIP_MERGE != 'none' }}
+        run: |
+          set -euo pipefail
+          ORIG_HEAD="$(git rev-parse HEAD)"
+          git remote add cip "$CIP_GIT_URL"
+          git fetch --no-tags cip "+refs/heads/${CIP_MERGE}:refs/remotes/cip/${CIP_MERGE}"
+          CIP_SHA="$(git rev-parse --short=12 "cip/${CIP_MERGE}")"
+          CIP_LV="$(git show "cip/${CIP_MERGE}:localversion-st" 2>/dev/null || echo 'none')"
+
+          MERGE_EXIT=0
+          git merge --no-commit --no-ff "cip/${CIP_MERGE}" || MERGE_EXIT=$?
+          if [ "$MERGE_EXIT" -ge 128 ]; then
+            echo "::error::Fatal git merge error ($MERGE_EXIT)"
+            exit "$MERGE_EXIT"
+          fi
+
+          if [ "$MERGE_EXIT" -ne 0 ]; then
+            # 0. For include/net/sock.h, keep BOTH sides of its single struct sock conflict hunk so CIP's
+            #    clean-merged static inlines (sk_owner_clear, sk_owner_put, sk_nulls_replace_node_init_rcu, sock_rmem_free)
+            #    and Android's KABI reserves are all preserved
+            if [ -f include/net/sock.h ] && grep -q '^<<<<<<< ' include/net/sock.h; then
+              sed -i '/^<<<<<<< /d; /^=======$/d; /^>>>>>>> /d' include/net/sock.h
+              git add include/net/sock.h
+            fi
+
+            # 1. Resolve remaining modify/delete (deleted non-Samsung DTS/tg3) and content conflicts (Exynos850/OneUI/5.10 backports)
+            git diff --name-only --diff-filter=U > /tmp/cip-conflicted-files.txt
+            while IFS= read -r cfile; do
+              [ -n "$cfile" ] || continue
+              if ! git cat-file -e "HEAD:${cfile}" 2>/dev/null; then
+                git rm -f "$cfile"
+              else
+                git checkout --ours -- "$cfile"
+                git add "$cfile"
+              fi
+            done < /tmp/cip-conflicted-files.txt
+
+            # 2. Additive fixes required by clean-merged CIP files:
+            #    (a) fs/Makefile: CIP commit bd82c675967d ("fs: common implementation of file type") adds fs_types.o
+            if [ -f fs/fs_types.c ] && ! grep -q 'fs_types\.o' fs/Makefile; then
+              sed -i 's/fs_context\.o fs_parser\.o/fs_context.o fs_parser.o fs_types.o/' fs/Makefile
+              git add fs/Makefile
+            fi
+
+            #    (b) include/linux/fs.h: CIP commit bd82c675967d adds #include <linux/fs_types.h>
+            if [ -f include/linux/fs_types.h ] && ! grep -q '<linux/fs_types\.h>' include/linux/fs.h; then
+              sed -i '/#include <linux\/android_kabi\.h>/a #include <linux/fs_types.h>' include/linux/fs.h
+              git add include/linux/fs.h
+            fi
+
+            #    (c) include/net/addrconf.h & net/ipv6/addrconf.c:
+            #        - CIP commit d289479f070a adds in6_dev_hold_safe() used by net/ipv6/mcast.c
+            #        - CIP commit babbfae4dda8 makes __ipv6_get_lladdr() static in net/ipv6/addrconf.c
+            if ! grep -q 'in6_dev_hold_safe' include/net/addrconf.h; then
+              sed -i '/void inet6_ifa_finish_destroy(struct inet6_ifaddr \*ifp);/i static inline bool in6_dev_hold_safe(struct inet6_dev *idev)\n{\n\treturn refcount_inc_not_zero(\&idev->refcnt);\n}\n' include/net/addrconf.h
+            fi
+            sed -i '/int __ipv6_get_lladdr(struct inet6_dev \*idev, struct in6_addr \*addr,/,/u32 banned_flags);/d' include/net/addrconf.h
+            git add include/net/addrconf.h
+
+            #    (d) net/ipv4/inet_connection_sock.c:
+            #        - CIP commit f9544eee41e7 ("tcp/dccp: Don't use timer_pending() in reqsk_queue_unlink().")
+            #          calls 6.x helper timer_delete_sync(), which in Linux 4.19 is del_timer_sync()
+            if [ -f net/ipv4/inet_connection_sock.c ] && grep -q 'timer_delete_sync' net/ipv4/inet_connection_sock.c; then
+              sed -i 's/\btimer_delete_sync\b/del_timer_sync/g' net/ipv4/inet_connection_sock.c
+              git add net/ipv4/inet_connection_sock.c
+            fi
+
+            #    (e) drivers/md/dm-verity-debug.c:
+            #        - CIP commit 0c8cbac25b40 ("dm-verity: make error counter atomic") changed v->corrupted_errs
+            #          from unsigned int to atomic_t in dm-verity.h, breaking Samsung's out-of-tree dm-verity-debug.c
+            if [ -f drivers/md/dm-verity-debug.c ] && grep -q 'atomic_t corrupted_errs' drivers/md/dm-verity.h; then
+              sed -i 's/v->corrupted_errs++/atomic_inc(\&v->corrupted_errs)/g; s/v->corrupted_errs >=/atomic_read(\&v->corrupted_errs) >=/g; s/v->corrupted_errs ==/atomic_read(\&v->corrupted_errs) ==/g' drivers/md/dm-verity-debug.c
+              git add drivers/md/dm-verity-debug.c
+            fi
+
+            #    (f) Prevent FT_MAX macro collision (defined as 8 in include/linux/fs_types.h)
+            #        with enum FT_MAX in drivers/soc/samsung/exynos_cpu_perf/exynos_perf_ncmemcpy.c
+            while IFS= read -r ftf; do
+              [ -n "$ftf" ] || continue
+              sed -i 's/\bFT_MAX\b/DRV_FT_MAX/g' "$ftf"
+              git add "$ftf"
+            done < <(grep -rl '\bFT_MAX\b' drivers/ sound/ arch/arm64/ 2>/dev/null || true)
+
+            # 3. Keep Samsung OneUI fs/ext4, fs/f2fs, drivers/usb (+ usb/{hcd,gadget}.h), and drivers/mmc coherent
+            #    (include/linux/usb.h stays on CIP's variadic usb_maxpacket macro so both 2-arg and 3-arg callers compile)
+            git checkout "$ORIG_HEAD" -- fs/ext4 fs/f2fs drivers/usb include/linux/usb/hcd.h include/linux/usb/gadget.h drivers/mmc include/linux/mmc
+            git add fs/ext4 fs/f2fs drivers/usb include/linux/usb/hcd.h include/linux/usb/gadget.h drivers/mmc include/linux/mmc
+          fi
+
+          if [ "$STRIP_CIP_LOCALVERSION" = "true" ]; then
+            rm -f localversion-st localversion-cip .gitlab-ci.yml
+            git rm --ignore-unmatch -f localversion-st localversion-cip .gitlab-ci.yml >/dev/null 2>&1 || true
+          fi
+
+          git commit -m "Merge cip/${CIP_MERGE} (${CIP_SHA}, ${CIP_LV}) into ${KERNEL_BRANCH}"
+          {
+            echo "### CIP Merge"
+            echo "- Merged \`cip/${CIP_MERGE}\` @ \`${CIP_SHA}\` (\`localversion-st: ${CIP_LV}\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu \
+            lz4 zstd cpio rsync xz-utils zip unzip curl git python3
+
+      - name: Set up Neutron Clang
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/toolchains/neutron-clang"
+          cd "$HOME/toolchains/neutron-clang"
+          curl -fsSLO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S
+          echo "$HOME/toolchains/neutron-clang/bin" >> "$GITHUB_PATH"
+          "$HOME/toolchains/neutron-clang/bin/clang" --version | head -1
+
+      - name: Add KernelSU (backslashxx official setup.sh)
+        if: ${{ env.KSU_VARIANT == 'backslashxx' }}
+        id: ksu_backslashxx
+        run: |
+          set -euo pipefail
+          REPO="${KSU_REPO}"
+          if [ -z "$REPO" ] || [ "$REPO" = "samakshkambxj/OriginSU" ]; then
+            REPO="backslashxx/KernelSU"
+          fi
+          rm -rf KernelSU
+          git clone "https://github.com/${REPO}.git" KernelSU
+          REF="${KSU_REF:-$(git -C KernelSU symbolic-ref --short HEAD)}"
+          bash KernelSU/kernel/setup.sh "$REF"
+
+          test -L drivers/kernelsu && test -f drivers/kernelsu/Kconfig
+          grep -q 'kernelsu' drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
+          SHORT="$(git -C KernelSU rev-parse --short=10 HEAD)"
+          echo "short=${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "repo=${REPO}"   >> "$GITHUB_OUTPUT"
+          {
+            echo "### KernelSU (backslashxx)"
+            echo "- \`${REPO}\` @ \`${REF}\` ($(git -C KernelSU rev-parse HEAD))"
+            echo "- hook method: \`${KSU_HOOK}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch OriginSU and apply kernel integration
+        if: ${{ env.KSU_VARIANT == 'originsu' }}
+        id: originsu
+        run: |
+          set -euo pipefail
+          REPO="${KSU_REPO}"
+          if [ -z "$REPO" ] || [ "$REPO" = "backslashxx/KernelSU" ]; then
+            REPO="samakshkambxj/OriginSU"
+          fi
+          REF="${KSU_REF:-main}"
+
+          rm -rf KernelSU
+          git clone "https://github.com/${REPO}.git" KernelSU
+          cd KernelSU
+          git fetch --tags --force origin
+
+          # Prefer remote-tracking branch, fall back to tag/commit.
+          if git rev-parse --verify --quiet "origin/${REF}" >/dev/null; then
+            git checkout --force "origin/${REF}"
+          else
+            git checkout --force "${REF}"
+          fi
+          git submodule update --init --recursive || true
+
+          SHA="$(git rev-parse HEAD)"
+          SHORT="$(git rev-parse --short=12 HEAD)"
+          SUBJECT="$(git log -1 --format='%s')"
+          echo "sha=${SHA}"     >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "repo=${REPO}"   >> "$GITHUB_OUTPUT"
+          echo "ref=${REF}"     >> "$GITHUB_OUTPUT"
+          cd ..
+
+          # Locate kernel-integration.diff in CI repo or generate it inline
+          INTEGRATION_DIFF=""
+          for candidate in \
+            "$ARIA_CI/.github/originsu/kernel-integration.diff" \
+            "$ARIA_CI/.github/aria/kernel-integration.diff" \
+            "$ARIA_CI/kernel-integration.diff" \
+            ".github/originsu/kernel-integration.diff"; do
+            if [ -f "$candidate" ]; then
+              INTEGRATION_DIFF="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$INTEGRATION_DIFF" ]; then
+            INTEGRATION_DIFF="/tmp/kernel-integration.diff"
+            cat > "$INTEGRATION_DIFF" <<'EOF'
+          diff --git a/drivers/Kconfig b/drivers/Kconfig
+          --- a/drivers/Kconfig
+          +++ b/drivers/Kconfig
+          @@ -264,4 +264,5 @@ source "drivers/sensorhub/sensor/Kconfig" # ADDED BY LEGO AUTOMATICALLY: DO NOT
+           source "drivers/sensorhub/sensorhub/Kconfig" # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
+           source "drivers/sensorhub/vendor/Kconfig" # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
+           source "drivers/sensors_lego/Kconfig" # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
+          +source "drivers/kernelsu/Kconfig"
+           endmenu
+          diff --git a/drivers/Makefile b/drivers/Makefile
+          --- a/drivers/Makefile
+          +++ b/drivers/Makefile
+          @@ -228,3 +228,5 @@ obj-y += vibrator/dc/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
+           obj-y += battery/common/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
+           obj-y += sensorhub/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
+           obj-y += sensors_lego/ # ADDED BY LEGO AUTOMATICALLY: DO NOT SUBMIT
+          +
+          +obj-$(CONFIG_KSU) += kernelsu/
+          diff --git a/fs/exec.c b/fs/exec.c
+          --- a/fs/exec.c
+          +++ b/fs/exec.c
+          @@ -1912,12 +1912,33 @@ static int __do_execve_file(int fd, struct filename *filename,
+           	return retval;
+           }
+           
+          +#ifdef CONFIG_KSU_MANUAL_HOOK
+          +__attribute__((hot))
+          +extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+          +				void *argv, void *envp, int *flags);
+          +__attribute__((hot))
+          +extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,
+          +				void *argv, void *envp, int *flags, int *retval);
+          +#endif
+          +
+           static int do_execveat_common(int fd, struct filename *filename,
+           			      struct user_arg_ptr argv,
+           			      struct user_arg_ptr envp,
+           			      int flags)
+           {
+          +#ifdef CONFIG_KSU_MANUAL_HOOK
+          +	int retval;
+          +
+          +	ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+          +
+          +	retval = __do_execve_file(fd, filename, argv, envp, flags, NULL);
+          +
+          +	ksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);
+          +
+          +	return retval;
+          +#else
+           	return __do_execve_file(fd, filename, argv, envp, flags, NULL);
+          +#endif
+           }
+           
+           int do_execve_file(struct file *file, void *__argv, void *__envp)
+          diff --git a/fs/open.c b/fs/open.c
+          --- a/fs/open.c
+          +++ b/fs/open.c
+          @@ -444,8 +444,17 @@ long do_faccessat(int dfd, const char __user *filename, int mode)
+           	return res;
+           }
+           
+          +#ifdef CONFIG_KSU_MANUAL_HOOK
+          +__attribute__((hot))
+          +extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+          +				int *mode, int *flags);
+          +#endif
+          +
+           SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+           {
+          +#ifdef CONFIG_KSU_MANUAL_HOOK
+          +	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          +#endif
+           	return do_faccessat(dfd, filename, mode);
+           }
+           
+          diff --git a/fs/stat.c b/fs/stat.c
+          --- a/fs/stat.c
+          +++ b/fs/stat.c
+          @@ -353,6 +353,17 @@ SYSCALL_DEFINE2(newlstat, const char __user *, filename,
+           	return cp_new_stat(&stat, statbuf);
+           }
+           
+          +#ifdef CONFIG_KSU_MANUAL_HOOK
+          +__attribute__((hot))
+          +extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
+          +				int *flags);
+          +
+          +extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
+          +#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
+          +extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);
+          +#endif
+          +#endif
+          +
+           #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
+           SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+           		struct stat __user *, statbuf, int, flag)
+          @@ -360,6 +371,9 @@ SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+           	struct kstat stat;
+           	int error;
+           
+          +#ifdef CONFIG_KSU_MANUAL_HOOK
+          +	ksu_handle_stat(&dfd, &filename, &flag);
+          +#endif
+           	error = vfs_fstatat(dfd, filename, &stat, flag);
+           	if (error)
+           		return error;
+          @@ -375,6 +389,9 @@ SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
+           	if (!error)
+           		error = cp_new_stat(&stat, statbuf);
+           
+          +#ifdef CONFIG_KSU_MANUAL_HOOK
+          +	ksu_handle_newfstat_ret(&fd, &statbuf);
+          +#endif
+           	return error;
+           }
+           
+          @@ -501,6 +518,9 @@ SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
+           	if (!error)
+           		error = cp_new_stat64(&stat, statbuf);
+           
+          +#ifdef CONFIG_KSU_MANUAL_HOOK /* for 32-bit */
+          +	ksu_handle_fstat64_ret(&fd, &statbuf);
+          +#endif
+           	return error;
+           }
+           
+          @@ -510,6 +530,9 @@ SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,
+           	struct kstat stat;
+           	int error;
+           
+          +#ifdef CONFIG_KSU_MANUAL_HOOK /* 32-bit su */
+          +	ksu_handle_stat(&dfd, &filename, &flag);
+          +#endif
+           	error = vfs_fstatat(dfd, filename, &stat, flag);
+           	if (error)
+           		return error;
+          diff --git a/kernel/reboot.c b/kernel/reboot.c
+          --- a/kernel/reboot.c
+          +++ b/kernel/reboot.c
+          @@ -313,6 +313,10 @@ DEFINE_MUTEX(system_transition_mutex);
+            *
+            * reboot doesn't sync: do that yourself before calling this.
+            */
+          +#ifdef CONFIG_KSU_MANUAL_HOOK
+          +extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
+          +#endif
+          +
+           SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+           		void __user *, arg)
+           {
+          @@ -320,6 +324,9 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+           	char buffer[256];
+           	int ret = 0;
+           
+          +#ifdef CONFIG_KSU_MANUAL_HOOK
+          +	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+          +#endif
+           	/* We only trust the superuser with rebooting the system. */
+           	if (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))
+           		return -EPERM;
+          diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+          --- a/security/selinux/selinuxfs.c
+          +++ b/security/selinux/selinuxfs.c
+          @@ -265,7 +265,7 @@ static int sel_mmap_handle_status(struct file *filp,
+           			       size, vma->vm_page_prot);
+           }
+           
+          -static const struct file_operations sel_handle_status_ops = {
+          +const struct file_operations sel_handle_status_ops = {
+           	.open		= sel_open_handle_status,
+           	.read		= sel_read_handle_status,
+           	.mmap		= sel_mmap_handle_status,
+          @@ -777,7 +777,7 @@ static ssize_t sel_write_relabel(struct file *file, char *buf, size_t size);
+           static ssize_t sel_write_user(struct file *file, char *buf, size_t size);
+           static ssize_t sel_write_member(struct file *file, char *buf, size_t size);
+           
+          -static ssize_t (*const write_op[])(struct file *, char *, size_t) = {
+          +ssize_t (*const write_op[])(struct file *, char *, size_t) = {
+           	[SEL_ACCESS] = sel_write_access,
+           	[SEL_CREATE] = sel_write_create,
+           	[SEL_RELABEL] = sel_write_relabel,
+          diff --git a/security/selinux/ss/services.c b/security/selinux/ss/services.c
+          --- a/security/selinux/ss/services.c
+          +++ b/security/selinux/ss/services.c
+          @@ -94,7 +94,7 @@ static int context_struct_to_string(struct policydb *policydb,
+           				    char **scontext,
+           				    u32 *scontext_len);
+           
+          -static void context_struct_compute_av(struct policydb *policydb,
+          +void context_struct_compute_av(struct policydb *policydb,
+           				      struct context *scontext,
+           				      struct context *tcontext,
+           				      u16 tclass,
+          @@ -453,7 +453,7 @@ static int dump_masked_av_helper(void *k, void *d, void *args)
+           	return 0;
+           }
+           
+          -static void security_dump_masked_av(struct policydb *policydb,
+          +void security_dump_masked_av(struct policydb *policydb,
+           				    struct context *scontext,
+           				    struct context *tcontext,
+           				    u16 tclass,
+          @@ -615,7 +615,7 @@ void services_compute_xperms_drivers(
+            * Compute access vectors and extended permissions based on a context
+            * structure pair for the permissions in a particular class.
+            */
+          -static void context_struct_compute_av(struct policydb *policydb,
+          +void context_struct_compute_av(struct policydb *policydb,
+           				      struct context *scontext,
+           				      struct context *tcontext,
+           				      u16 tclass,
+          EOF
+          fi
+
+          if [ "$SUSFS" != "false" ]; then
+            # SuSFS uses OriginSU's inline-hook mode; keep only the non-hook integration here.
+            git apply -C1 --verbose \
+              --include='drivers/Kconfig' \
+              --include='drivers/Makefile' \
+              --include='security/selinux/selinuxfs.c' \
+              --include='security/selinux/ss/services.c' \
+              "$INTEGRATION_DIFF" || true
+          else
+            git apply -C1 --verbose \
+              --exclude='arch/arm64/configs/*' \
+              "$INTEGRATION_DIFF" || patch -p1 -F3 --forward --no-backup-if-mismatch < "$INTEGRATION_DIFF" || true
+          fi
+
+          # Explicitly guarantee Kconfig, Makefile, and SELinux static exports
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          grep -q 'kernelsu/' drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          sed -i 's/^static const struct file_operations sel_handle_status_ops = {/const struct file_operations sel_handle_status_ops = {/' security/selinux/selinuxfs.c
+          sed -i 's/^static ssize_t (\*const write_op\[\])(struct file \*, char \*, size_t) = {/ssize_t (*const write_op[])(struct file *, char *, size_t) = {/' security/selinux/selinuxfs.c
+          sed -i 's/^static void security_dump_masked_av(struct policydb \*policydb,/void security_dump_masked_av(struct policydb *policydb,/' security/selinux/ss/services.c
+          sed -i 's/^static void context_struct_compute_av(struct policydb \*policydb,/void context_struct_compute_av(struct policydb *policydb,/' security/selinux/ss/services.c
+
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          test -L drivers/kernelsu && test -f drivers/kernelsu/Kconfig
+
+          {
+            echo "### OriginSU"
+            echo ""
+            echo "- repo: \`${REPO}\`"
+            echo "- ref: \`${REF}\`"
+            echo "- commit: [\`${SHORT}\`](https://github.com/${REPO}/commit/${SHA})"
+            echo "- subject: ${SUBJECT}"
+            echo "- mode: \`$([ "$SUSFS" != "false" ] && echo "SuSFS inline hook" || echo "manual hook")\`"
+            echo "- KPM: \`${KPM}\`, NoMount: \`${NOMOUNT}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply SuSFS 2.3.0 (OriginSU inline-hook mode)
+        if: ${{ env.KSU_VARIANT == 'originsu' && env.SUSFS != 'false' }}
+        env:
+          SUSFS_PATCH_COMMIT: 118ac2bc4f8bc25a41f0aef0d766ddc977feaec3
+        run: |
+          set -euo pipefail
+          URL="https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/${SUSFS_PATCH_COMMIT}/Patches/Patch/susfs_patch_to_4.19.patch"
+          curl -fsSL "$URL" -o /tmp/susfs_patch_to_4.19.patch
+
+          # This Samsung 4.19 tree backports the fs_context mount API, so the
+          # vfs_kern_mount hunk in fs/namespace.c is expected to reject and is
+          # replaced by the vfs_create_mount compat hunk below.
+          rm -f /tmp/susfs.rej
+          if ! patch -p1 -F3 --forward --no-backup-if-mismatch -r /tmp/susfs.rej \
+                < /tmp/susfs_patch_to_4.19.patch; then
+            echo "::notice::SuSFS patch reported rejects; checking them"
+          fi
+          if [ -s /tmp/susfs.rej ]; then
+            if ! grep -q 'vfs_kern_mount' /tmp/susfs.rej; then
+              echo "::error::Unexpected SuSFS rejects"
+              cat /tmp/susfs.rej
+              exit 1
+            fi
+            echo "::notice::Expected vfs_kern_mount reject; applying fs_context compat hunk"
+          fi
+
+          # Ensure susfs.o is wired into fs/Makefile even if CIP modified nearby lines
+          grep -q 'susfs\.o' fs/Makefile || sed -i '/nsfs\.o/a obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile
+
+          # Locate or generate susfs-2.3.0-vfs-create-mount.diff
+          VFS_MOUNT_DIFF=""
+          for candidate in \
+            "$ARIA_CI/.github/originsu/susfs-2.3.0-vfs-create-mount.diff" \
+            "$ARIA_CI/.github/aria/susfs-2.3.0-vfs-create-mount.diff" \
+            "$ARIA_CI/susfs-2.3.0-vfs-create-mount.diff" \
+            ".github/originsu/susfs-2.3.0-vfs-create-mount.diff"; do
+            if [ -f "$candidate" ]; then
+              VFS_MOUNT_DIFF="$candidate"
+              break
+            fi
+          done
+          if [ -z "$VFS_MOUNT_DIFF" ]; then
+            VFS_MOUNT_DIFF="/tmp/susfs-2.3.0-vfs-create-mount.diff"
+            cat > "$VFS_MOUNT_DIFF" <<'EOF'
+          diff --git a/fs/namespace.c b/fs/namespace.c
+          --- a/fs/namespace.c
+          +++ b/fs/namespace.c
+          @@ -1167,7 +1167,22 @@ struct vfsmount *vfs_create_mount(struct fs_context *fc)
+           	if (!fc->root)
+           		return ERR_PTR(-EINVAL);
+           
+          +#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          +	/*
+          +	 * This tree backported the fs_context mount API, so alloc_vfsmnt()
+          +	 * happens here instead of in vfs_kern_mount().
+          +	 */
+          +	if (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted)) {
+          +		if (susfs_is_current_ksu_domain()) {
+          +			mnt = susfs_alloc_non_unshare_ksu_vfsmnt(fc->source ?: "none");
+          +			goto bypass_orig_flow;
+          +		}
+          +	}
+          +#endif
+           	mnt = alloc_vfsmnt(fc->source ?: "none");
+          +#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          +bypass_orig_flow:
+          +#endif
+           	if (!mnt)
+           		return ERR_PTR(-ENOMEM);
+           
+          EOF
+          fi
+          git apply -C1 "$VFS_MOUNT_DIFF" || patch -p1 -F3 --forward --no-backup-if-mismatch < "$VFS_MOUNT_DIFF"
+
+          # Locate or generate susfs-2.3.0-no-show-options2.diff
+          NO_SHOW_OPTS2_DIFF=""
+          for candidate in \
+            "$ARIA_CI/.github/originsu/susfs-2.3.0-no-show-options2.diff" \
+            "$ARIA_CI/.github/aria/susfs-2.3.0-no-show-options2.diff" \
+            "$ARIA_CI/susfs-2.3.0-no-show-options2.diff" \
+            ".github/originsu/susfs-2.3.0-no-show-options2.diff"; do
+            if [ -f "$candidate" ]; then
+              NO_SHOW_OPTS2_DIFF="$candidate"
+              break
+            fi
+          done
+          if [ -z "$NO_SHOW_OPTS2_DIFF" ]; then
+            NO_SHOW_OPTS2_DIFF="/tmp/susfs-2.3.0-no-show-options2.diff"
+            cat > "$NO_SHOW_OPTS2_DIFF" <<'EOF'
+          --- a/fs/proc_namespace.c
+          +++ b/fs/proc_namespace.c
+          @@ -274,9 +274,7 @@
+           	if (err)
+           		goto out;
+           	show_mnt_opts(m, mnt);
+          -	if (sb->s_op->show_options2)
+          -			err = sb->s_op->show_options2(mnt, m, mnt_path.dentry);
+          -	else if (sb->s_op->show_options)
+          +	if (sb->s_op->show_options)
+           		err = sb->s_op->show_options(m, mnt_path.dentry);
+           	seq_puts(m, " 0 0\n");
+           out:
+          @@ -341,9 +339,7 @@
+           	err = show_sb_opts(m, sb);
+           	if (err)
+           		goto out;
+          -	if (sb->s_op->show_options2) {
+          -		err = sb->s_op->show_options2(mnt, m, mnt->mnt_root);
+          -	} else if (sb->s_op->show_options)
+          +	if (sb->s_op->show_options)
+           		err = sb->s_op->show_options(m, mnt->mnt_root);
+           	seq_putc(m, '\n');
+           out:
+          EOF
+          fi
+          git apply -C1 "$NO_SHOW_OPTS2_DIFF" || patch -p1 -F3 --forward --no-backup-if-mismatch < "$NO_SHOW_OPTS2_DIFF"
+
+          # Guard d_path() ERR_PTR return values in fdinfo/fd
+          sed -i 's/if (!dpath) {/if (IS_ERR_OR_NULL(dpath)) {/' fs/notify/fdinfo.c fs/proc/fd.c
+
+          # Apply pinned SuSFS inline-hook script and adapt ksu_handle_sys_read + execve NULL filename check
+          INLINE_URL="https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/${SUSFS_PATCH_COMMIT}/Patches/susfs_inline_hook_patches.sh"
+          curl -fsSL "$INLINE_URL" -o /tmp/susfs_inline_hook_patches.sh
+          bash /tmp/susfs_inline_hook_patches.sh
+
+          sed -i 's/extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd);/extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);/' fs/read_write.c
+          sed -i 's/ksu_handle_sys_read(fd);/ksu_handle_sys_read(fd, \&buf, \&count);/' fs/read_write.c
+          sed -i 's/if (likely(susfs_is_current_proc_no_su()))/if (!filename || likely(susfs_is_current_proc_no_su()))/' fs/exec.c
+
+          # Verify every hook OriginSU's inline_hook_check.mk expects
+          grep -q 'ksu_handle_execveat' fs/exec.c
+          grep -q 'ksu_handle_faccessat' fs/open.c
+          grep -q 'ksu_handle_stat' fs/stat.c
+          grep -q 'ksu_handle_sys_read' fs/read_write.c
+          grep -q 'ksu_handle_sys_reboot' kernel/reboot.c
+          grep -q 'ksu_handle_setresuid' kernel/sys.c
+          grep -q 'ksu_handle_input_handle_event' drivers/input/input.c
+          grep -m1 'SUSFS_VERSION' include/linux/susfs.h
+
+          SUSFS_VERSION="$(sed -n 's/^#define SUSFS_VERSION "\(.*\)"/\1/p' include/linux/susfs.h)"
+          {
+            echo "### SuSFS"
+            echo ""
+            echo "- version: \`${SUSFS_VERSION}\`"
+            echo "- source: \`JackA1ltman/NonGKI_Kernel_Build_2nd@${SUSFS_PATCH_COMMIT}\` (4.19 non-GKI backport)"
+            echo "- mode: \`inline hook\`"
+            echo "- mount-api compat: \`fs/namespace.c\` \`vfs_create_mount()\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Integrate OriginSU vendored NoMount v2.2.0
+        if: ${{ env.KSU_VARIANT == 'originsu' && env.NOMOUNT == 'true' }}
+        run: |
+          set -euo pipefail
+          test -d KernelSU/userspace/nomount/kernel/src
+          ln -sfn ../KernelSU/userspace/nomount/kernel/src fs/nomount
+          grep -q 'fs/nomount/Kconfig' fs/Kconfig || sed -i '/^endmenu/i source "fs/nomount/Kconfig"' fs/Kconfig
+          grep -q 'nomount/' fs/Makefile || printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
+          # If this 4.19 tree backported the 6-argument __vfs_getxattr(..., int flags), enable FLAGS_ARG/FLAGS_VAL in nomount.h
+          if grep -q '__vfs_getxattr.*int' include/linux/xattr.h; then
+            sed -i 's/#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)/#if 1/' KernelSU/userspace/nomount/kernel/src/nomount.h
+          fi
+
+      - name: Backport path_umount (KernelSU official guide, "Umount modules")
+        run: |
+          set -euo pipefail
+          if grep -q 'int path_umount' fs/namespace.c; then
+            echo "path_umount already present"
+          else
+            git apply -C1 --verbose "$ARIA_CI/.github/aria/path-umount.diff" || \
+              patch -p1 -F3 --forward --no-backup-if-mismatch < "$ARIA_CI/.github/aria/path-umount.diff"
+          fi
+
+      - name: pkenti defconfig changes
+        if: ${{ env.PKENTI_CONFIG == 'true' }}
+        run: |
+          set -euo pipefail
+          D="arch/arm64/configs/${DEFCONFIG}"
+          grep -E '^(CONFIG_|# CONFIG_)' "$ARIA_CI/.github/aria/pkenti.config" > /tmp/pkenti.lines
+          while IFS= read -r line; do
+            opt="$(echo "$line" | sed -E 's/^# (CONFIG_[A-Za-z0-9_]+) is not set$/\1/; s/^(CONFIG_[A-Za-z0-9_]+)=.*/\1/')"
+            sed -i "/^${opt}=/d;/^# ${opt} is not set/d" "$D"
+          done < /tmp/pkenti.lines
+          { echo ''; echo '# pkenti'; cat /tmp/pkenti.lines; } >> "$D"
+          wc -l /tmp/pkenti.lines
+
+      - name: Keep traffic-control options on (NET_CLS_MATCHALL, NET_ACT_BPF)
+        run: |
+          set -euo pipefail
+          D="arch/arm64/configs/${DEFCONFIG}"
+          sed -i '/^CONFIG_NET_CLS_MATCHALL=/d;/^# CONFIG_NET_CLS_MATCHALL is not set/d;/^CONFIG_NET_ACT_BPF=/d;/^# CONFIG_NET_ACT_BPF is not set/d' "$D"
+          printf '\nCONFIG_NET_CLS_MATCHALL=y\nCONFIG_NET_ACT_BPF=y\n' >> "$D"
+
+      - name: CPU governors (all built in, default ${{ github.event.inputs.cpu_governor || 'schedutil' }})
+        run: |
+          set -euo pipefail
+          D="arch/arm64/configs/${DEFCONFIG}"
+          GOVS="PERFORMANCE POWERSAVE USERSPACE ONDEMAND CONSERVATIVE SCHEDUTIL ENERGYSTEP"
+          for g in $GOVS; do
+            sed -i "/^CONFIG_CPU_FREQ_GOV_${g}=/d;/^# CONFIG_CPU_FREQ_GOV_${g} is not set/d" "$D"
+            sed -i "/^CONFIG_CPU_FREQ_DEFAULT_GOV_${g}=/d;/^# CONFIG_CPU_FREQ_DEFAULT_GOV_${g} is not set/d" "$D"
+          done
+          DEF="$(echo "$CPU_GOVERNOR" | tr a-z A-Z)"
+          echo "$GOVS" | grep -qw "$DEF"
+          {
+            echo ''
+            echo '# CPU governors'
+            for g in $GOVS; do
+              echo "CONFIG_CPU_FREQ_GOV_${g}=y"
+              if [ "$g" = "$DEF" ]; then echo "CONFIG_CPU_FREQ_DEFAULT_GOV_${g}=y"
+              else echo "# CONFIG_CPU_FREQ_DEFAULT_GOV_${g} is not set"; fi
+            done
+          } >> "$D"
+          grep -n 'CPU_FREQ_GOV_\|CPU_FREQ_DEFAULT_GOV_' "$D"
+
+      - name: physwizz defconfig changes
+        if: ${{ env.PHYSWIZZ_CONFIG == 'true' }}
+        run: |
+          set -euo pipefail
+          D="arch/arm64/configs/${DEFCONFIG}"
+          sed -i '/^CONFIG_CRYPTO_LZ4=/d;/^# CONFIG_CRYPTO_LZ4 is not set/d;/^CONFIG_CRYPTO_LZO=/d;/^# CONFIG_CRYPTO_LZO is not set/d' "$D"
+          sed -i '/^CONFIG_KPROBES=/d;/^# CONFIG_KPROBES is not set/d;/^CONFIG_KPROBE_EVENTS=/d;/^# CONFIG_KPROBE_EVENTS is not set/d' "$D"
+          sed -i '/^CONFIG_STACKPROTECTOR_STRONG=/d;/^# CONFIG_STACKPROTECTOR_STRONG is not set/d' "$D"
+          sed -i '/^CONFIG_LOCALVERSION_AUTO=/d;/^# CONFIG_LOCALVERSION_AUTO is not set/d' "$D"
+          {
+            echo ''
+            echo '# physwizz'
+            echo 'CONFIG_CRYPTO_LZ4=y'
+            echo '# CONFIG_KPROBES is not set'
+            echo '# CONFIG_KPROBE_EVENTS is not set'
+            echo '# CONFIG_STACKPROTECTOR_STRONG is not set'
+            echo '# CONFIG_LOCALVERSION_AUTO is not set'
+          } >> "$D"
+
+      - name: Frequency modes (${{ github.event.inputs.freq_method || 'minimal' }}, cpu ${{ github.event.inputs.cpu_freq_mode || 'stock' }}, gpu ${{ github.event.inputs.gpu_freq_mode || 'stock' }})
+        if: ${{ env.CPU_FREQ_MODE != 'stock' || env.GPU_FREQ_MODE != 'stock' }}
+        run: |
+          set -euo pipefail
+          FULL=0; [ "$FREQ_METHOD" != "full" ] || FULL=1
+          CMIN=0; CMAX=0; CSUS=0; GMIN=0; GMAX=0; GSUS=0
+          case "$CPU_FREQ_MODE" in
+            uc) CMIN=130000; CMAX=2002000 ;;
+            oc) CMIN=130000; if [ "$FULL" = 1 ]; then CMAX=2314000; CSUS=1; else CMAX=2210000; fi ;;
+          esac
+          if [ "$GPU_FREQ_MODE" = "oc" ]; then GMAX=1196000; [ "$FULL" != 1 ] || { GMIN=100000; GSUS=1; }; fi
+          cat > include/linux/aria_freq.h <<'EOF'
+          #ifndef _LINUX_ARIA_FREQ_H
+          #define _LINUX_ARIA_FREQ_H
+          /* generated by the Aria workflow, kHz, 0 = off */
+          #define ARIA_FULL        __FULL__
+          #define ARIA_CPU_MIN_KHZ __CMIN__
+          #define ARIA_CPU_MAX_KHZ __CMAX__
+          #define ARIA_CPU_SUSTAIN __CSUS__
+          #define ARIA_GPU_MIN_KHZ __GMIN__
+          #define ARIA_GPU_MAX_KHZ __GMAX__
+          #endif
+          EOF
+          sed -i "s/__FULL__/${FULL}/;s/__CMIN__/${CMIN}/;s/__CMAX__/${CMAX}/;s/__CSUS__/${CSUS}/;s/__GMIN__/${GMIN}/;s/__GMAX__/${GMAX}/" include/linux/aria_freq.h
+          cat include/linux/aria_freq.h
+          D="$ARIA_CI/.github/aria"
+          git apply --verbose "$D/pkenti-core.diff"
+          if [ "$FULL" = 1 ]; then
+            [ "$CPU_FREQ_MODE" = "stock" ] || git apply --verbose "$D/pkenti-dts-cpu.diff"
+            if [ "$GPU_FREQ_MODE" = "oc" ]; then
+              git apply --verbose "$D/pkenti-dts-gpu.diff"
+              git apply --verbose "$D/pkenti-gpu-pm.diff"
+            fi
+          else
+            [ "$GPU_FREQ_MODE" != "oc" ] || git apply --verbose "$D/a12s-dts-gpu.diff"
+          fi
+
+      - name: CPU idle - TEO governor (pkenti)
+        if: ${{ env.CPU_IDLE_TEO == 'true' }}
+        run: |
+          set -euo pipefail
+          git apply --verbose "$ARIA_CI/.github/aria/pkenti-teo.diff"
+          D="arch/arm64/configs/${DEFCONFIG}"
+          sed -i '/^CONFIG_CPU_IDLE_GOV_TEO=/d;/^# CONFIG_CPU_IDLE_GOV_TEO is not set/d' "$D"
+          echo 'CONFIG_CPU_IDLE_GOV_TEO=y' >> "$D"
+
+      - name: SELinux mode (${{ github.event.inputs.selinux || 'enforcing' }})
+        run: |
+          set -euo pipefail
+          D="arch/arm64/configs/${DEFCONFIG}"
+          sed -i '/^CONFIG_SECURITY_SELINUX_ALWAYS_\(PERMISSIVE\|ENFORCE\)/d;/^# CONFIG_SECURITY_SELINUX_ALWAYS_\(PERMISSIVE\|ENFORCE\)/d' "$D"
+          if [ "$SELINUX" = "permissive" ]; then
+            git apply -C1 --verbose "$ARIA_CI/.github/aria/selinux-always-permissive.diff" || \
+              patch -p1 -F3 --forward --no-backup-if-mismatch < "$ARIA_CI/.github/aria/selinux-always-permissive.diff"
+            {
+              echo 'CONFIG_SECURITY_SELINUX_ALWAYS_PERMISSIVE=y'
+              echo '# CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE is not set'
+            } >> "$D"
+          else
+            {
+              echo '# CONFIG_SECURITY_SELINUX_ALWAYS_PERMISSIVE is not set'
+              echo '# CONFIG_SECURITY_SELINUX_ALWAYS_ENFORCE is not set'
+            } >> "$D"
+          fi
+          grep -n 'SELINUX_ALWAYS' "$D"
+
+      - name: Kernel command line (SELinux + undervolt)
+        run: |
+          set -euo pipefail
+          D="arch/arm64/configs/${DEFCONFIG}"
+          for v in "$CPU_UV" "$GPU_UV"; do
+            case "$v" in ''|*[!0-9]*) echo "::error::undervolt must be a whole number of microvolts, got '$v'"; exit 1;; esac
+          done
+          [ "$CPU_UV" -le 100000 ] && [ "$GPU_UV" -le 100000 ] || { echo "::error::undervolt above 100000 uV refused"; exit 1; }
+          ARGS=""
+          [ "$SELINUX" != "permissive" ] || ARGS="$ARGS androidboot.selinux=permissive"
+          [ "$CPU_UV" = 0 ] || ARGS="$ARGS lit=-${CPU_UV} big=-${CPU_UV}"
+          [ "$GPU_UV" = 0 ] || ARGS="$ARGS g3d=-${GPU_UV}"
+          ARGS="${ARGS# }"
+          sed -i '/^CONFIG_CMDLINE=/d' "$D"
+          echo "CONFIG_CMDLINE=\"${ARGS}\"" >> "$D"
+          grep -n '^CONFIG_CMDLINE' "$D"
+
+      - name: Enable KernelSU / OriginSU / SuSFS / KPM in the defconfig
+        run: |
+          set -euo pipefail
+          D="arch/arm64/configs/${DEFCONFIG}"
+          test -f "$D"
+          sed -i '/^CONFIG_KSU/d;/^# CONFIG_KSU/d;/^CONFIG_KPM=/d;/^# CONFIG_KPM is not set/d;/^CONFIG_NOMOUNT=/d;/^# CONFIG_NOMOUNT is not set/d' "$D"
+
+          if [ "$KSU_VARIANT" = "originsu" ]; then
+            {
+              echo ''
+              echo '# KernelSU (OriginSU)'
+              echo 'CONFIG_KSU=y'
+              echo '# CONFIG_KSU_TRACEPOINT_HOOK is not set'
+              echo '# CONFIG_KSU_TAMPER_SYSCALL_TABLE is not set'
+              echo 'CONFIG_KSU_ORIGIN_VEIL=y'
+              echo 'CONFIG_KSU_MULTI_MANAGER_SUPPORT=y'
+              if [ "$SUSFS" != "false" ]; then
+                echo '# CONFIG_KSU_MANUAL_HOOK is not set'
+                echo 'CONFIG_KSU_SUSFS=y'
+                echo 'CONFIG_KSU_SUSFS_SUS_PATH=y'
+                echo 'CONFIG_KSU_SUSFS_SUS_MOUNT=y'
+                echo 'CONFIG_KSU_SUSFS_SUS_KSTAT=y'
+                echo 'CONFIG_KSU_SUSFS_SPOOF_UNAME=y'
+                echo 'CONFIG_KSU_SUSFS_ENABLE_LOG=y'
+                echo 'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y'
+                echo 'CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y'
+                echo 'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y'
+                echo 'CONFIG_KSU_SUSFS_SUS_MAP=y'
+              else
+                echo '# CONFIG_KSU_SUSFS is not set'
+                echo 'CONFIG_KSU_MANUAL_HOOK=y'
+                echo 'CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y'
+                echo 'CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y'
+                echo 'CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y'
+              fi
+            } >> "$D"
+
+            if [ "$KPM" = "true" ]; then
+              sed -i '/^CONFIG_KALLSYMS=/d;/^# CONFIG_KALLSYMS is not set/d;/^CONFIG_KALLSYMS_ALL=/d;/^# CONFIG_KALLSYMS_ALL is not set/d' "$D"
+              if sed -n '/^config KALLSYMS_ALL/,/^[^ \t]/p' init/Kconfig | grep -q 'depends on.*DEBUG_KERNEL'; then
+                sed -i '/^CONFIG_DEBUG_KERNEL=/d;/^# CONFIG_DEBUG_KERNEL is not set/d' "$D"
+                echo 'CONFIG_DEBUG_KERNEL=y' >> "$D"
+              fi
+              {
+                echo 'CONFIG_KALLSYMS=y'
+                echo 'CONFIG_KALLSYMS_ALL=y'
+                echo 'CONFIG_KPM=y'
+              } >> "$D"
+            else
+              echo '# CONFIG_KPM is not set' >> "$D"
+            fi
+
+            if [ "$NOMOUNT" = "true" ]; then
+              echo 'CONFIG_NOMOUNT=y' >> "$D"
+            fi
+          else
+            {
+              echo ''
+              echo '# KernelSU (backslashxx)'
+              echo 'CONFIG_KSU=y'
+              if [ "$KSU_HOOK" = "syscall_table" ]; then
+                echo 'CONFIG_KSU_TAMPER_SYSCALL_TABLE=y'
+              else
+                echo 'CONFIG_KSU_HACK_ARM64_BRANCH_LINK=y'
+              fi
+            } >> "$D"
+          fi
+
+          sed -i "s/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"-${KNAME}\"/" "$D"
+          grep -q '^CONFIG_KALLSYMS=y' "$D"
+          grep -n 'CONFIG_KSU\|CONFIG_KPM\|CONFIG_NOMOUNT\|LOCALVERSION=' "$D"
+
+      - name: Configure kernel
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" ARCH="$ARCH" O="$OUT" LLVM=1 LLVM_IAS=1 \
+            KCFLAGS="-w -Wno-error=sizeof-pointer-memaccess" \
+            CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+            PLATFORM_VERSION=14 ANDROID_MAJOR_VERSION=14 \
+            KBUILD_BUILD_USER=aria KBUILD_BUILD_HOST=github "$DEFCONFIG"
+          C="$OUT/.config"
+          have() { grep -E "^(# )?$1( |=)" "$C" | head -n1 || true; }
+          need() { grep -qxF "$1" "$C" || { echo "::error::missing in .config: $1   (has: $(have "$2"))"; exit 1; }; }
+          want() { grep -qxF "$1" "$C" || echo "::warning::not applied: $1   (has: $(have "$2"))"; }
+          unwant() { ! grep -qxF "$1" "$C" || echo "::warning::still set: $1"; }
+
+          need 'CONFIG_KSU=y' CONFIG_KSU
+          need "CONFIG_LOCALVERSION=\"-${KNAME}\"" CONFIG_LOCALVERSION
+
+          if [ "$KSU_VARIANT" = "originsu" ]; then
+            need 'CONFIG_KSU_ORIGIN_VEIL=y' CONFIG_KSU_ORIGIN_VEIL
+            need 'CONFIG_KSU_MULTI_MANAGER_SUPPORT=y' CONFIG_KSU_MULTI_MANAGER_SUPPORT
+            if [ "$SUSFS" != "false" ]; then
+              need 'CONFIG_KSU_SUSFS=y' CONFIG_KSU_SUSFS
+              unwant 'CONFIG_KSU_MANUAL_HOOK=y'
+            else
+              need 'CONFIG_KSU_MANUAL_HOOK=y' CONFIG_KSU_MANUAL_HOOK
+              unwant 'CONFIG_KSU_SUSFS=y'
+            fi
+            if [ "$KPM" = "true" ]; then
+              need 'CONFIG_KPM=y' CONFIG_KPM
+              need 'CONFIG_KALLSYMS=y' CONFIG_KALLSYMS
+              need 'CONFIG_KALLSYMS_ALL=y' CONFIG_KALLSYMS_ALL
+            else
+              unwant 'CONFIG_KPM=y'
+            fi
+            if [ "$NOMOUNT" = "true" ]; then
+              need 'CONFIG_NOMOUNT=y' CONFIG_NOMOUNT
+            fi
+          else
+            if [ "$KSU_HOOK" = "syscall_table" ]; then
+              need 'CONFIG_KSU_TAMPER_SYSCALL_TABLE=y' CONFIG_KSU_TAMPER_SYSCALL_TABLE
+            else
+              need 'CONFIG_KSU_HACK_ARM64_BRANCH_LINK=y' CONFIG_KSU_HACK_ARM64_BRANCH_LINK
+            fi
+          fi
+
+          if [ "$SELINUX" = "permissive" ]; then
+            need 'CONFIG_SECURITY_SELINUX_ALWAYS_PERMISSIVE=y' CONFIG_SECURITY_SELINUX_ALWAYS_PERMISSIVE
+          else
+            unwant 'CONFIG_SECURITY_SELINUX_ALWAYS_PERMISSIVE=y'
+          fi
+          DEF="$(echo "$CPU_GOVERNOR" | tr a-z A-Z)"
+          for g in PERFORMANCE POWERSAVE USERSPACE ONDEMAND CONSERVATIVE SCHEDUTIL ENERGYSTEP; do
+            need "CONFIG_CPU_FREQ_GOV_${g}=y" "CONFIG_CPU_FREQ_GOV_${g}"
+          done
+          need "CONFIG_CPU_FREQ_DEFAULT_GOV_${DEF}=y" "CONFIG_CPU_FREQ_DEFAULT_GOV_${DEF}"
+
+          if [ "$PHYSWIZZ_CONFIG" = "true" ]; then
+            want 'CONFIG_CRYPTO_LZ4=y' CONFIG_CRYPTO_LZ4
+            unwant 'CONFIG_KPROBES=y'
+            unwant 'CONFIG_STACKPROTECTOR_STRONG=y'
+            unwant 'CONFIG_LOCALVERSION_AUTO=y'
+          fi
+          if [ "$PKENTI_CONFIG" = "true" ]; then
+            want 'CONFIG_DEFAULT_TCP_CONG="bbr"' CONFIG_DEFAULT_TCP_CONG
+            want 'CONFIG_HZ=300' CONFIG_HZ
+          fi
+          want 'CONFIG_CMDLINE_EXTEND=y' CONFIG_CMDLINE_EXTEND
+          want 'CONFIG_NET_CLS_MATCHALL=y' CONFIG_NET_CLS_MATCHALL
+          want 'CONFIG_NET_ACT_BPF=y' CONFIG_NET_ACT_BPF
+          [ "$CPU_IDLE_TEO" != "true" ] || want 'CONFIG_CPU_IDLE_GOV_TEO=y' CONFIG_CPU_IDLE_GOV_TEO
+          echo "config checks finished"
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" ARCH="$ARCH" O="$OUT" LLVM=1 LLVM_IAS=1 \
+            KCFLAGS="-w -Wno-error=sizeof-pointer-memaccess" \
+            CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+            PLATFORM_VERSION=14 ANDROID_MAJOR_VERSION=14 \
+            KBUILD_BUILD_USER=aria KBUILD_BUILD_HOST=github Image dtbs
+
+      - name: Verify image + KernelSU / SuSFS / KPM symbols
+        run: |
+          set -euo pipefail
+          test -f "$OUT/arch/arm64/boot/Image"
+          echo "kernel.release: $(cat "$OUT/include/config/kernel.release")"
+          echo "ksu_* symbols in System.map: $(grep -c ' ksu_' "$OUT/System.map" || true)"
+          if [ "$KSU_VARIANT" = "originsu" ]; then
+            echo "OriginSU commit: ${{ steps.originsu.outputs.short }}"
+            if [ "$SUSFS" != "false" ]; then
+              grep -q '^CONFIG_KSU_SUSFS=y' "$OUT/.config"
+              echo "SuSFS: $(grep -m1 'SUSFS_VERSION' include/linux/susfs.h)"
+              echo "susfs_* symbols in System.map: $(grep -c ' susfs_' "$OUT/System.map" || true)"
+            fi
+            if [ "$KPM" = "true" ]; then
+              grep -q '^CONFIG_KPM=y' "$OUT/.config"
+              grep -q ' sukisu_kpm_load_module_path$' "$OUT/System.map"
+              echo "sukisu_kpm_* symbols in System.map: $(grep -c ' sukisu_kpm_' "$OUT/System.map" || true)"
+            fi
+          fi
+
+      - name: Make dtb.img
+        run: |
+          set -euo pipefail
+          DTB="$(find "$OUT/arch/arm64/boot/dts" -name 'exynos3830.dtb' | head -n1)"
+          test -n "$DTB" || { echo "::error::exynos3830.dtb was not built"; exit 1; }
+          python3 "$ARIA_CI/.github/aria/mkdtbimg.py" "$DTB" "$OUT/arch/arm64/boot/dtb.img"
+          ls -l "$OUT/arch/arm64/boot/Image" "$OUT/arch/arm64/boot/dtb.img"
+
+      - name: Upload Image and dtb.img (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aria-Image-${{ env.KSU_VARIANT }}${{ env.KSU_VARIANT == 'originsu' && (env.SUSFS != 'false' && '-susfs' || '-nosusfs') || '' }}${{ env.KSU_VARIANT == 'originsu' && env.KPM == 'true' && '-kpm' || '' }}
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/arch/arm64/boot/dtb.img
+          if-no-files-found: error
+
+      - name: Upload .config
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aria-config
+          path: kernel/out/.config
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+      - name: Release plain Image and dtb.img
+        if: ${{ env.RELEASE == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: aria-${{ github.run_number }}
+          name: Aria A135F #${{ github.run_number }} (${{ env.KSU_VARIANT }}, susfs=${{ env.SUSFS }}, kpm=${{ env.KPM }}, ${{ env.FREQ_METHOD }}, cpu ${{ env.CPU_FREQ_MODE }}, gpu ${{ env.GPU_FREQ_MODE }}, ${{ env.SELINUX }}, cip ${{ env.CIP_MERGE }})
+          body: |
+            Plain `Image` and `dtb.img` for the Galaxy A13 (SM-A135F). Flash both.
+            - kernel: ${{ env.KERNEL_REPO }} @ ${{ env.KERNEL_BRANCH }}
+            - CIP merge: ${{ env.CIP_MERGE }}
+            - KernelSU variant: ${{ env.KSU_VARIANT }} (${{ steps.originsu.outputs.repo || steps.ksu_backslashxx.outputs.repo }} @ ${{ steps.originsu.outputs.short || steps.ksu_backslashxx.outputs.short }})
+            - OriginSU options: SuSFS=${{ env.SUSFS }}, KPM=${{ env.KPM }}, NoMount=${{ env.NOMOUNT }}, Veil=true, Multi-Manager=true
+            - backslashxx hook: ${{ env.KSU_HOOK }}
+            - SELinux: ${{ env.SELINUX }}
+            - frequency method: ${{ env.FREQ_METHOD }}, cpu: ${{ env.CPU_FREQ_MODE }}, gpu: ${{ env.GPU_FREQ_MODE }}
+            - CPU governor default: ${{ env.CPU_GOVERNOR }}, TEO idle: ${{ env.CPU_IDLE_TEO }}
+          files: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/arch/arm64/boot/dtb.img
+          fail_on_unmatched_files: true
